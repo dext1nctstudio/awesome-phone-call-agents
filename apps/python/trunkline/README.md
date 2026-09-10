@@ -42,7 +42,7 @@ python3 -m trunkline --data ./data vault-check      # no identifier escaped the 
 python3 -m trunkline --data ./data audit --verify   # the audit chain is intact
 python3 -m trunkline --data ./data console          # http://127.0.0.1:8770, loopback only
 
-python3 -m pytest                                   # 85 tests, all offline
+python3 -m pytest                                   # 90 tests, all offline
 ```
 
 Python 3.9 or newer, standard library only. `pytest` is the only development dependency.
@@ -50,6 +50,14 @@ Python 3.9 or newer, standard library only. `pytest` is the only development dep
 `--force` ignores the calling-window hold so a fixture demo runs outside business hours. It exists for `preview` and `fixture`; live mode refuses it.
 
 ### What a run looks like
+
+Every bundle in the demo has a recording of its own, so any workflow runs. This is the
+Meridian claim-status bundle, the one that holds twice:
+
+```bash
+python3 -m trunkline --data ./data run --mode fixture \
+    --workflow claim_status --payer pay_meridian --force
+```
 
 ```text
 Meridian Health Plan - claim_status - 3 claim(s) - +12*******42
@@ -74,7 +82,10 @@ Fixture mode runs the real client against a local fake of the CALL-E Calls API (
 | Scenario | What comes back | What Trunkline does |
 | --- | --- | --- |
 | `claim_status_paid` | Three claims: paid, denied, still in process, after a transfer into a second queue | All three answered; 23m 40s of hold recorded across two segments |
+| `cascade_claim_status` | Two Cascade claims on one call: one paid with an EFT trace, one denied | Both answered after a single 11m 44s hold |
+| `claim_status_in_process` | A claim still sitting in medical review, nothing owed by the office | Answered as `in_process` after a 3m 11s hold |
 | `denial_reason_co97` | CO-97 with remark N130, appealable, with a deadline and an address | Denial reason recorded with the appeal route |
+| `cascade_denial_reason` | CO-16 with remark M51, where a corrected claim is accepted instead of an appeal | Denial recorded with resubmission as the next action, not appeal |
 | `prior_auth_pending` | Authorization pending, clinical history missing | Answered as pending, with what the plan is waiting for |
 | `eligibility_active` | Coverage active, deductible and cost sharing given | Benefits recorded for the date of service |
 | `not_on_file` | The plan has no record of the claim | Recorded as `not_on_file`, which means resubmit, not appeal |
@@ -187,8 +198,8 @@ trunkline/workqueue.py   bundling, priority, the deadline guardrail
 trunkline/engine.py      one call end to end, and reconciliation
 trunkline/audit.py       hash-chained, append-only audit log
 trunkline/console.py     loopback review console
-fixtures/                eleven terminal call fixtures, two of them adversarial
-tests/                   85 tests, offline, no credentials
+fixtures/                fourteen terminal call fixtures, two of them adversarial
+tests/                   90 tests, offline, no credentials
 docs/safety.md, docs/scheduler.md, docs/architecture.md
 ```
 

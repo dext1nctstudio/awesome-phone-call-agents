@@ -198,7 +198,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     placed = 0
     try:
         for bundle in bundles:
-            scenario = args.scenario or demo.DEFAULT_SCENARIOS.get(bundle.workflow)
+            scenario = demo.scenario_for(
+                FIXTURES_DIR,
+                bundle.workflow,
+                [claim.claim_number for claim in bundle.claims],
+                explicit=args.scenario,
+            )
             payer = ctx.ledger.payer(bundle.payer_id)
             out("-" * 78)
             out("%s - %s - %d claim(s) - %s"

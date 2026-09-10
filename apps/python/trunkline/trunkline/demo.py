@@ -7,9 +7,11 @@ value, not a real registration.
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from .client import CalleError, load_fixture
 from .models import Claim, Ledger, Payer, Practice
+from .verify import normalize_claim_number
 
 PRACTICE = Practice(
     id="prac_lakeshore",
@@ -122,9 +124,74 @@ def build() -> Tuple[Ledger, Dict[str, Dict[str, str]]]:
     return ledger, VAULT
 
 
-DEFAULT_SCENARIOS: Dict[str, str] = {
-    "claim_status": "claim_status_paid",
-    "denial_reason": "denial_reason_co97",
-    "prior_auth_status": "prior_auth_pending",
-    "eligibility": "eligibility_active",
+# ---------------------------------------------------------------------------
+# Which recording a bundle replays in fixture mode.
+# ---------------------------------------------------------------------------
+# A recording only means something replayed against the claims it was made for.
+# Playing Meridian's transcript at a Cascade bundle returns an answer about
+# claims nobody asked about, so every claim on the call comes back ungrounded
+# and the call is marked unusable. That looks like the evidence guard firing
+# when it is really the wrong tape in the machine, and a demonstration whose
+# first call fails for a bookkeeping reason teaches the reader nothing.
+#
+# So the scenario is chosen by claim number: among the recordings for this
+# workflow, the one that covers the most of this bundle's claims wins.
+#
+# The adversarial fixtures are deliberately absent here. ``ungrounded_evidence``
+# and ``schema_violation`` carry the same claim numbers as ``claim_status_paid``
+# and would match just as well, but they exist to be asked for by name with
+# ``--scenario``. A guardrail should fire because someone aimed it, not because
+# a lookup happened to land there.
+
+CANONICAL_SCENARIOS: Dict[str, Tuple[str, ...]] = {
+    "claim_status": ("claim_status_paid", "cascade_claim_status", "claim_status_in_process"),
+    "denial_reason": ("denial_reason_co97", "cascade_denial_reason"),
+    "prior_auth_status": ("prior_auth_pending",),
+    "eligibility": ("eligibility_active",),
 }
+
+DEFAULT_SCENARIOS: Dict[str, str] = {
+    workflow: scenarios[0] for workflow, scenarios in CANONICAL_SCENARIOS.items()
+}
+
+
+def _fixture_claim_numbers(fixture: Dict[str, object]) -> Set[str]:
+    result = fixture.get("structured_result")
+    if not isinstance(result, dict):
+        return set()
+    numbers = set()
+    for entry in result.get("claims") or []:
+        if isinstance(entry, dict):
+            numbers.add(normalize_claim_number(str(entry.get("claim_number", ""))))
+    numbers.discard("")
+    return numbers
+
+
+def scenario_for(
+    fixtures_dir: str,
+    workflow: str,
+    claim_numbers: Iterable[str],
+    explicit: Optional[str] = None,
+) -> Optional[str]:
+    """The recording to replay for this bundle.
+
+    ``explicit`` is whatever the operator passed to ``--scenario`` and always
+    wins, including the adversarial fixtures. Otherwise the canonical recording
+    covering the most of these claims is chosen, falling back to the workflow
+    default when none of them mentions this bundle at all.
+    """
+    if explicit:
+        return explicit
+    wanted = {normalize_claim_number(number) for number in claim_numbers}
+    wanted.discard("")
+    best: Optional[str] = None
+    best_covered = 0
+    for name in CANONICAL_SCENARIOS.get(workflow, ()):
+        try:
+            fixture = load_fixture(fixtures_dir, name)
+        except CalleError:
+            continue
+        covered = len(wanted & _fixture_claim_numbers(fixture))
+        if covered > best_covered:
+            best, best_covered = name, covered
+    return best or DEFAULT_SCENARIOS.get(workflow)
