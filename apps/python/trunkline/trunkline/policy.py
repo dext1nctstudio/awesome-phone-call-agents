@@ -100,6 +100,9 @@ ALL_PARTY_CONSENT_STATES: Tuple[str, ...] = (
 REGIONS: Dict[str, Dict[str, object]] = {
     "US": {"cc": "1", "min": 10, "max": 10, "nanp": True},
     "CA": {"cc": "1", "min": 10, "max": 10, "nanp": True},
+    # Australian geographic and mobile numbers have a nine-digit national
+    # significant number after +61. The domestic trunk prefix (0) is omitted.
+    "AU": {"cc": "61", "min": 9, "max": 9},
 }
 
 E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")

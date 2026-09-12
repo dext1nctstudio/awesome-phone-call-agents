@@ -13,6 +13,17 @@ def test_a_valid_us_number_is_accepted(number):
     assert policy.validate_destination(number, "US") == number
 
 
+def test_a_valid_australian_mobile_number_is_accepted():
+    number = "+61400000000"
+    assert policy.validate_destination(number, "AU") == number
+
+
+@pytest.mark.parametrize("number", ["+610400000000", "+6140000000", "+614000000000"])
+def test_an_invalid_australian_number_is_refused(number):
+    with pytest.raises(policy.PolicyError):
+        policy.validate_destination(number, "AU")
+
+
 @pytest.mark.parametrize(
     "number",
     ["2125550142", "+1212555014", "+1 212 555 0142", "+11125550142", "+19005550142", "tel:+12125550142"],
@@ -24,7 +35,7 @@ def test_a_bad_number_is_refused(number):
 
 def test_an_unconfigured_region_is_refused():
     with pytest.raises(policy.PolicyError):
-        policy.validate_destination("+442075550142", "GB")
+        policy.validate_destination("+33142345678", "FR")
 
 
 def test_a_number_from_another_region_is_refused():

@@ -220,6 +220,6 @@ docs/safety.md, docs/scheduler.md, docs/architecture.md
 - **A date of birth spelled out in words** ("March eleventh nineteen eighty four") is not caught by the scrubber, which handles digit and written forms. Speech transcripts normally return digits.
 - **The redactor is a matcher, not a classifier.** It removes the identifiers it was given plus Social Security and email patterns. It does not detect an identifier that is in neither the vault nor those patterns.
 - **Callbacks are out of reach.** Payers often offer to call back rather than hold. CALL-E is outbound-only, so Trunkline declines and stays in the queue.
-- **Region validation covers the United States and Canada** with NANP length and prefix rules, not a full numbering-plan library. Add a region to `policy.REGIONS` deliberately before dialling it.
+- **Region validation covers the United States, Canada, and Australia** with explicit country-code and length rules. NANP destinations also receive prefix validation. This is not a full numbering-plan library; add any other region to `policy.REGIONS` deliberately before dialling it.
 - **One recipient per call task.** Conference and three-way calls are out of scope.
 - **The learned menu path is a hint, not a map.** A payer that changes its phone tree makes the stored path stale; the agent is told to adapt, and nothing depends on the path being right.
