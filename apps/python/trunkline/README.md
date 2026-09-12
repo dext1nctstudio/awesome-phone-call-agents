@@ -185,10 +185,10 @@ Nothing leaves Trunkline on its own. An answered claim sits in `answered` until 
 
 | View | What it is for |
 | --- | --- |
-| **Workflow** | The pipeline as a diagram: the spine a claim follows when everything works, and a column to the right for every way it can stop. Pan and zoom it, click any stage to read what it does and how many claims are sitting there. The live counts come off the ledger, so it is a view of this practice's work rather than a picture of the architecture |
-| **Work queue** | Every claim, highest priority first, with its deadline and whether its answer is grounded |
-| **Calls** | Every call with its hold receipt, cost estimate and reference number |
-| **Needs a person** | The review queue: extracted fields beside the quote that supports them, and the approve button |
+| **Overview** | The operating summary: urgent review work, groundedness, pending reconciliation, hold time returned to staff, recent calls, and live counts through the claim path |
+| **Claims** | Every claim, highest priority first, with searchable action, exception, and closed views |
+| **Call history** | Every call with its measured hold receipt, cost estimate, reference number, findings, and scrubbed transcript |
+| **Review** | A focused split view with the queue on the left and extracted fields, supporting evidence, and the human approval action on the right |
 
 The console is local only. It has no authentication, so it refuses to bind anything but loopback, rejects a request whose `Host` is not loopback, requires a header on writes that a cross-site form post cannot set, and cannot place a call. The page is a shell: every value a reader sees is fetched as JSON and written into the document as text rather than as markup, so a sentence spoken on a phone call can never become part of the page.
 
@@ -207,7 +207,7 @@ trunkline/workqueue.py   bundling, priority, the deadline guardrail
 trunkline/engine.py      one call end to end, and reconciliation
 trunkline/audit.py       hash-chained, append-only audit log
 trunkline/console.py     loopback review console: JSON endpoints and the one write
-trunkline/ui.py          the pipeline graph, the stylesheet, the client
+trunkline/ui.py          the operations workspace, stylesheet, and browser client
 fixtures/                fourteen terminal call fixtures, two of them adversarial
 tests/                   90 tests, offline, no credentials
 docs/safety.md, docs/scheduler.md, docs/architecture.md

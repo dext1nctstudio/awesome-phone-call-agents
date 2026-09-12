@@ -1,11 +1,8 @@
-"""The console's presentation layer: the pipeline graph, the stylesheet, the client.
+"""Presentation for the local Trunkline payer-operations console.
 
-The console is a reviewer's tool, so the thing worth showing is not a list of
-rows but the path a claim takes and where it is stopped. ``graph`` describes
-that path as nodes and edges and hangs the ledger's live counts on it, and the
-client draws it. Everything here is static text apart from ``graph``; the
-browser fetches the data separately as JSON and renders it with ``textContent``
-so no ledger value is ever parsed as markup.
+The server exposes only JSON and one approval action. The browser turns those
+records into a compact operating surface and writes every ledger value through
+``textContent`` so provider-derived text is never parsed as markup.
 """
 from __future__ import annotations
 
@@ -24,123 +21,74 @@ from .models import (
 
 REACHED_OUTCOMES = ("answered", "partial", "not_on_file")
 
-# ---------------------------------------------------------------------------
-# The pipeline
-# ---------------------------------------------------------------------------
-# Coordinates are laid out by hand rather than by a layout algorithm. The shape
-# is the argument: one straight spine down the middle for the path a claim takes
-# when everything works, and one column to the right for every way it can stop.
-# A reader should be able to see, without reading a word, that the right-hand
-# column is where the guardrails put things.
-
-NODE_W = 258
-NODE_H = 62
-SPINE_X = 40
-STOP_X = 430
 
 _NODES: List[Dict[str, Any]] = [
-    {"id": "intake", "kind": "start", "x": SPINE_X, "y": 0,
-     "label": "Backlog import", "sub": "CSV, 835 ERA, EHR export",
-     "detail": "Claims arrive with a payer, a workflow, a billed amount and a timely-filing "
-               "deadline. The patient is a pointer: identifiers never enter the ledger, they go "
-               "to the vault."},
-    {"id": "score", "kind": "step", "x": SPINE_X, "y": 112,
-     "label": "Priority scoring", "sub": "value x deadline pressure",
-     "detail": "Priority is the claim's value multiplied by how close its filing deadline is. A "
-               "claim inside 14 days preempts everything; past the deadline it is suppressed, "
-               "because a call can no longer change the outcome."},
-    {"id": "bundle", "kind": "step", "x": SPINE_X, "y": 224,
-     "label": "Bundle by payer", "sub": "one hold, not N",
-     "detail": "Claims for the same payer and workflow ride one call, up to that payer's own "
-               "cap. Reaching a representative is the expensive part, so it is paid once instead "
-               "of once per claim."},
-    {"id": "gate", "kind": "decision", "x": SPINE_X, "y": 336,
-     "label": "May we call?", "sub": "thirteen named holds",
-     "detail": "The calling window in the payer's own timezone, the hold budget, the per-run call "
-               "cap, the cost cap, the filing deadline, an unreconciled earlier call, a missing "
-               "vault record, the kill switch, and the four authorization checks. Any one of them "
-               "stops the call and says which."},
-    {"id": "held", "kind": "stop", "x": STOP_X, "y": 336,
-     "label": "Held", "sub": "with a named reason",
-     "detail": "No call is placed. The claim stays queued and the reason is recorded, so a held "
-               "claim is never a silent failure."},
-    {"id": "plan", "kind": "step", "x": SPINE_X, "y": 448,
-     "label": "Build the call plan", "sub": "task, schema, envelope",
-     "detail": "The task text, the closed result schema, and one narrowed disclosure per patient. "
-               "Each workflow may speak only the identifiers its envelope names: eligibility gets "
-               "a member id and a date of birth and no name, because it does not need one."},
-    {"id": "preflight", "kind": "decision", "x": SPINE_X, "y": 560,
-     "label": "Disclosure pre-flight", "sub": "would this task leak?",
-     "detail": "The planner reads its own finished task text back and refuses to return it if a "
-               "never-disclose value appears in it. The check runs before the request is built, "
-               "not after the call."},
-    {"id": "refused", "kind": "stop", "x": STOP_X, "y": 560,
-     "label": "Refused", "sub": "task never sent",
-     "detail": "The plan is thrown away rather than dialled. This is the last check that runs "
-               "entirely on our side of the wire."},
-    {"id": "call", "kind": "call", "x": SPINE_X, "y": 672,
-     "label": "CALL-E places the call", "sub": "menu, queue, hold, rep",
-     "detail": "The agent works the phone menu with the keypad, waits in the queue without "
-               "speaking, and talks to the representative. Hold is derived afterwards from the "
-               "gaps between transcript turns, so it is measured rather than estimated."},
-    {"id": "reached", "kind": "decision", "x": SPINE_X, "y": 790,
-     "label": "Did anyone answer?", "sub": "outcome from the call",
-     "detail": "hold_timeout, ivr_dead_end and unreached mean nobody was reached. Nothing is "
-               "recorded from those calls, because there is nothing to record."},
-    {"id": "requeue", "kind": "stop", "x": STOP_X, "y": 790,
-     "label": "Requeue", "sub": "try a different window",
-     "detail": "The claims go back to the queue tagged with the window that failed, so the next "
-               "attempt is scheduled somewhere else in the day."},
-    {"id": "schema", "kind": "decision", "x": SPINE_X, "y": 902,
-     "label": "Schema check", "sub": "closed, fields required",
-     "detail": "Validated locally rather than trusted from the response: no extra fields, every "
-               "field present, correct type, enum values inside the enum. A failure marks the "
-               "whole call unusable and sends every claim on it to a person."},
-    {"id": "ground", "kind": "decision", "x": SPINE_X, "y": 1014,
-     "label": "Is the quote real?", "sub": "found in the transcript",
-     "detail": "Every answer carries the representative's own words. The quote is searched for in "
-               "the transcript; one shorter than six words is refused however well it matches, "
-               "because a single common word is a coincidence and not evidence."},
-    {"id": "review", "kind": "human", "x": STOP_X, "y": 1014,
-     "label": "Human review", "sub": "fields reset to unknown",
-     "detail": "A claim whose quote cannot be found loses its substantive fields and goes to a "
-               "person. The other claims on the same call keep their answers: one bad extraction "
-               "does not discard a good one."},
-    {"id": "answered", "kind": "step", "x": SPINE_X, "y": 1126,
-     "label": "Answered", "sub": "every field has a quote",
-     "detail": "Recorded with the reference number, the representative's first name, the hold "
-               "receipt and the transcript, scrubbed of patient identifiers before it is written."},
-    {"id": "approve", "kind": "human", "x": SPINE_X, "y": 1238,
-     "label": "A person approves", "sub": "nothing leaves by itself",
-     "detail": "Trunkline gathers and structures. It never files an appeal, never agrees to an "
-               "amount, and never closes a claim by itself. This gate is not a limitation to be "
-               "removed later."},
-    {"id": "closed", "kind": "end", "x": SPINE_X, "y": 1350,
-     "label": "Closed and exportable", "sub": "no patient identifiers",
-     "detail": "The export carries claim numbers, plan answers and evidence quotes. It carries no "
-               "patient identifiers; vault-check walks every file Trunkline wrote to prove it."},
+    {
+        "id": "intake",
+        "kind": "start",
+        "label": "Backlog imported",
+        "sub": "Claims enter without patient identifiers",
+        "detail": "Claims arrive with a payer, workflow, billed amount, and filing deadline. Patient identifiers remain behind an opaque vault reference.",
+    },
+    {
+        "id": "score",
+        "kind": "step",
+        "label": "Priority scored",
+        "sub": "Value and deadline pressure",
+        "detail": "Claims closest to timely filing rise first. Work already past its deadline is suppressed because a call can no longer change the outcome.",
+    },
+    {
+        "id": "bundle",
+        "kind": "step",
+        "label": "Bundled by payer",
+        "sub": "One queue wait covers several claims",
+        "detail": "Claims sharing a payer and workflow ride one call, up to the payer's own cap.",
+    },
+    {
+        "id": "gate",
+        "kind": "decision",
+        "label": "Cleared to call",
+        "sub": "Authorization and cost controls",
+        "detail": "Calling window, hold budget, call cap, filing deadline, reconciliation state, vault record, kill switch, and authorization are checked before dispatch.",
+    },
+    {
+        "id": "call",
+        "kind": "call",
+        "label": "Payer contacted",
+        "sub": "Menu, queue, hold, and representative",
+        "detail": "The agent works the payer menu, waits in queue, and gathers a representative's answer. Hold is measured from transcript offsets.",
+    },
+    {
+        "id": "ground",
+        "kind": "decision",
+        "label": "Evidence verified",
+        "sub": "Every answer must match the transcript",
+        "detail": "Structured answers are checked locally and their evidence quote must be found in the transcript. Unsupported fields return to unknown.",
+    },
+    {
+        "id": "approve",
+        "kind": "human",
+        "label": "Human sign-off",
+        "sub": "A biller owns the final decision",
+        "detail": "Trunkline gathers and structures. A person decides whether an answer is ready to close and export.",
+    },
+    {
+        "id": "closed",
+        "kind": "end",
+        "label": "Closed",
+        "sub": "Exportable without patient identifiers",
+        "detail": "Approved answers can be exported with claim numbers, plan answers, and supporting quotes, but no patient identifiers.",
+    },
 ]
 
-_EDGES: List[Dict[str, Any]] = [
+_EDGES = [
     {"from": "intake", "to": "score"},
     {"from": "score", "to": "bundle"},
     {"from": "bundle", "to": "gate"},
-    {"from": "gate", "to": "held", "label": "suppressed", "tone": "stop"},
-    {"from": "gate", "to": "plan", "label": "clear"},
-    {"from": "plan", "to": "preflight"},
-    {"from": "preflight", "to": "refused", "label": "would leak", "tone": "stop"},
-    {"from": "preflight", "to": "call", "label": "clean"},
-    {"from": "call", "to": "reached"},
-    {"from": "reached", "to": "requeue", "label": "nobody", "tone": "stop"},
-    {"from": "reached", "to": "schema", "label": "reached"},
-    {"from": "schema", "to": "review", "label": "fails", "tone": "stop"},
-    {"from": "schema", "to": "ground", "label": "passes"},
-    {"from": "ground", "to": "review", "label": "no quote", "tone": "stop"},
-    {"from": "ground", "to": "answered", "label": "grounded"},
-    {"from": "review", "to": "approve", "tone": "muted"},
-    {"from": "answered", "to": "approve"},
+    {"from": "gate", "to": "call"},
+    {"from": "call", "to": "ground"},
+    {"from": "ground", "to": "approve"},
     {"from": "approve", "to": "closed"},
-    {"from": "requeue", "to": "bundle", "kind": "loop", "label": "next window", "tone": "muted"},
 ]
 
 
@@ -149,13 +97,9 @@ def _counts(ledger: Ledger) -> Dict[str, int]:
     for claim in ledger.claims:
         by_state[claim.state] = by_state.get(claim.state, 0) + 1
 
-    reached = [c for c in ledger.calls if c.outcome in REACHED_OUTCOMES]
-    stopped = [c for c in ledger.calls if c.outcome and c.outcome not in REACHED_OUTCOMES
-               and c.outcome != "unusable"]
-    unusable = [c for c in ledger.calls if c.outcome == "unusable"]
-
-    ungrounded = 0
+    reached = [call for call in ledger.calls if call.outcome in REACHED_OUTCOMES]
     grounded = 0
+    ungrounded = 0
     for record in ledger.calls:
         for fields in record.per_claim.values():
             if not isinstance(fields, dict):
@@ -170,34 +114,24 @@ def _counts(ledger: Ledger) -> Dict[str, int]:
         "score": len(ledger.claims),
         "bundle": len(ledger.calls),
         "gate": len(ledger.calls),
-        "held": 0,
-        "plan": len(ledger.calls),
-        "preflight": len(ledger.calls),
-        "refused": 0,
-        "call": len(ledger.calls),
-        "reached": len(reached),
-        "requeue": len(stopped),
-        "schema": len(unusable),
+        "call": len(reached),
         "ground": grounded,
-        "review": by_state.get(NEEDS_HUMAN, 0),
-        "answered": by_state.get(ANSWERED, 0) + by_state.get(CLOSED, 0),
         "approve": by_state.get(ANSWERED, 0),
         "closed": by_state.get(CLOSED, 0),
         "_queued": by_state.get(QUEUED, 0),
         "_in_flight": by_state.get(PENDING_CALL, 0) + by_state.get(PENDING_RECONCILIATION, 0),
+        "_review": by_state.get(NEEDS_HUMAN, 0),
         "_ungrounded": ungrounded,
     }
 
 
 def graph(ledger: Ledger) -> Dict[str, Any]:
-    """The pipeline, with the ledger's live counts hung on it."""
+    """Return the compact process model with counts from the current ledger."""
     counts = _counts(ledger)
     nodes = []
     for node in _NODES:
         entry = dict(node)
         entry["count"] = counts.get(node["id"], 0)
-        entry["w"] = NODE_W
-        entry["h"] = NODE_H
         nodes.append(entry)
     return {
         "nodes": nodes,
@@ -205,14 +139,11 @@ def graph(ledger: Ledger) -> Dict[str, Any]:
         "totals": {
             "claims": len(ledger.claims),
             "calls": len(ledger.calls),
-            "hold_seconds": sum(c.hold_seconds for c in ledger.calls),
-            "hold_human": hold.format_duration(sum(c.hold_seconds for c in ledger.calls)),
+            "hold_seconds": sum(call.hold_seconds for call in ledger.calls),
+            "hold_human": hold.format_duration(sum(call.hold_seconds for call in ledger.calls)),
             "queued": counts["_queued"],
             "in_flight": counts["_in_flight"],
-            # The "Needs a person" tab shows everything awaiting a human decision:
-            # NEEDS_HUMAN (ungrounded) and ANSWERED (grounded, awaiting approval).
-            # The "review" pipeline node's own count stays ungrounded-only.
-            "review": counts["review"] + counts["approve"],
+            "review": counts["_review"],
             "awaiting_approval": counts["approve"],
             "closed": counts["closed"],
             "ungrounded": counts["_ungrounded"],
@@ -222,750 +153,375 @@ def graph(ledger: Ledger) -> Dict[str, Any]:
 
 STYLE = """
 :root{
-  --serif:"Didot","Bodoni MT","Hoefler Text","Baskerville Old Face","Playfair Display",
-    Georgia,"Times New Roman",serif;
-  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
-  --bg:#f3f4f8; --panel:#ffffff; --ink:#14161d; --muted:#5b6379; --faint:#8b93a6;
-  --line:#e5e7ee; --line-strong:#d0d5e0; --dot:#d9dde6;
-  --accent:#6242f5; --accent-soft:#ece8ff;
-  --ok:#0c7a55; --ok-soft:#e0f6ed;
-  --warn:#8a5600; --warn-soft:#fdf0d9;
-  --stop:#b32741; --stop-soft:#fde8ec;
-  --human:#7734e0; --human-soft:#f0e8ff;
-  --grad:linear-gradient(135deg,#6242f5 0%,#b044ff 47%,#1fbfd4 100%);
-  --glow-a:rgba(98,66,245,.10); --glow-b:rgba(31,191,212,.08);
-  --hi:rgba(255,255,255,.85);
-  --shadow:0 1px 2px rgba(18,22,34,.05),0 8px 22px rgba(18,22,34,.06);
-  --shadow-lg:0 24px 60px rgba(18,22,34,.14);
-  --radius:14px;
-}
-:root[data-theme="dark"], :root:not([data-theme="light"]){}
-@media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]){
-    --bg:#08090d; --panel:#121419; --ink:#eceef4; --muted:#98a0b2; --faint:#6a7285;
-    --line:#1f222c; --line-strong:#2d3242; --dot:#1b1e27;
-    --accent:#9b7bff; --accent-soft:#1b1734;
-    --ok:#41d49b; --ok-soft:#0c2620;
-    --warn:#eab873; --warn-soft:#271d11;
-    --stop:#ff8a9f; --stop-soft:#2b151c;
-    --human:#c07bff; --human-soft:#231637;
-    --grad:linear-gradient(135deg,#7c5cff 0%,#c05cff 46%,#3fd0e0 100%);
-    --glow-a:rgba(124,92,255,.22); --glow-b:rgba(63,208,224,.13);
-    --hi:rgba(255,255,255,.055);
-    --shadow:0 1px 2px rgba(0,0,0,.5),0 10px 30px rgba(0,0,0,.45);
-    --shadow-lg:0 30px 74px rgba(0,0,0,.62);
-  }
+  --canvas:#f4f6f5;--surface:#ffffff;--surface-2:#f8faf9;--ink:#17201e;
+  --muted:#68736f;--faint:#8b9591;--line:#dfe5e2;--line-strong:#c8d1cd;
+  --sidebar:#17201e;--sidebar-2:#222c29;--sidebar-text:#f5f8f6;--sidebar-muted:#9eaaa6;
+  --brand:#ff7b5f;--accent:#176b57;--accent-soft:#e5f2ed;--blue:#315fbd;--blue-soft:#eaf0fb;
+  --amber:#9a6813;--amber-soft:#fbf1dc;--danger:#a5433b;--danger-soft:#f9e9e7;
+  --violet:#7446a7;--magenta:#b13b91;
+  --shadow:0 1px 2px rgba(20,32,28,.04),0 8px 24px rgba(20,32,28,.05);
+  --radius:6px;
 }
 :root[data-theme="dark"]{
-  --bg:#08090d; --panel:#121419; --ink:#eceef4; --muted:#98a0b2; --faint:#6a7285;
-  --line:#1f222c; --line-strong:#2d3242; --dot:#1b1e27;
-  --accent:#9b7bff; --accent-soft:#1b1734;
-  --ok:#41d49b; --ok-soft:#0c2620;
-  --warn:#eab873; --warn-soft:#271d11;
-  --stop:#ff8a9f; --stop-soft:#2b151c;
-  --human:#c07bff; --human-soft:#231637;
-  --grad:linear-gradient(135deg,#7c5cff 0%,#c05cff 46%,#3fd0e0 100%);
-  --glow-a:rgba(124,92,255,.22); --glow-b:rgba(63,208,224,.13);
-  --hi:rgba(255,255,255,.055);
-  --shadow:0 1px 2px rgba(0,0,0,.5),0 10px 30px rgba(0,0,0,.45);
-  --shadow-lg:0 30px 74px rgba(0,0,0,.62);
+  --canvas:#100c1b;--surface:rgba(31,24,51,.76);--surface-2:rgba(255,255,255,.045);--ink:#f7f4ff;
+  --muted:#bbb3cb;--faint:#877f9a;--line:rgba(255,255,255,.095);--line-strong:rgba(255,255,255,.17);
+  --sidebar:rgba(12,9,22,.9);--sidebar-2:rgba(255,255,255,.075);--sidebar-text:#f8f5ff;--sidebar-muted:#8f879f;
+  --brand:#9cff67;--accent:#64e5c4;--accent-soft:rgba(57,218,186,.12);--blue:#8aafff;--blue-soft:rgba(88,133,238,.14);
+  --amber:#ffd06a;--amber-soft:rgba(255,191,76,.12);--danger:#ff83ab;--danger-soft:rgba(244,76,143,.12);
+  --violet:#b782ff;--magenta:#ef63d2;
+  --shadow:0 18px 55px rgba(4,2,12,.28),inset 0 1px 0 rgba(255,255,255,.035);
 }
 *{box-sizing:border-box;}
 html,body{height:100%;}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased;
-  text-rendering:optimizeLegibility;}
-/* ambient light: two soft pools behind the content, never behind a surface */
-body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
-  background:
-    radial-gradient(680px 420px at 68% -8%,var(--glow-a),transparent 70%),
-    radial-gradient(560px 380px at 108% 64%,var(--glow-b),transparent 72%);}
-a{color:var(--accent);text-decoration:none;}
-a:hover{text-decoration:underline;text-underline-offset:3px;}
-button{font:inherit;color:inherit;}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
-  letter-spacing:-.01em;}
+body{margin:0;background:var(--canvas);color:var(--ink);font:14px/1.45 -apple-system,
+  BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;}
+button,input{font:inherit;color:inherit;}
+button{letter-spacing:0;}
+button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-offset:2px;}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;}
 .num{font-variant-numeric:tabular-nums;}
-
-/* ---------- frame ---------- */
-.app{position:relative;z-index:1;display:grid;grid-template-columns:236px 1fr;
-  grid-template-rows:60px 1fr;height:100vh;}
-header{grid-column:1/-1;display:flex;align-items:center;gap:16px;padding:0 20px;
-  background:color-mix(in srgb,var(--panel) 82%,transparent);
-  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
-  border-bottom:1px solid var(--line);}
-.brand{display:flex;align-items:center;gap:11px;font-family:var(--serif);font-weight:400;
-  font-size:15.5px;text-transform:uppercase;letter-spacing:.19em;}
-.brand:before{content:"";width:24px;height:24px;border-radius:8px;flex:none;
-  background:var(--grad);box-shadow:0 2px 10px var(--glow-a),inset 0 1px 0 rgba(255,255,255,.32);}
-.brand em{font-family:var(--sans);font-style:normal;color:var(--muted);font-weight:500;
-  font-size:9.5px;text-transform:uppercase;letter-spacing:.17em;
-  padding-left:12px;margin-left:3px;border-left:1px solid var(--line);}
-.hstats{margin-left:auto;display:flex;gap:22px;align-items:center;}
-.hstat{display:flex;flex-direction:column;line-height:1.2;gap:2px;}
-.hstat b{font-family:var(--serif);font-size:16.5px;font-weight:400;letter-spacing:.02em;
-  font-variant-numeric:tabular-nums;}
-.hstat span{font-size:9px;color:var(--faint);text-transform:uppercase;letter-spacing:.16em;
-  font-weight:600;}
-.themebtn{background:none;border:1px solid var(--line);border-radius:9px;width:32px;height:32px;
-  cursor:pointer;color:var(--muted);transition:border-color .15s,color .15s,background .15s;}
-.themebtn:hover{border-color:var(--line-strong);color:var(--ink);background:var(--bg);}
-
-nav{position:relative;background:var(--panel);border-right:1px solid var(--line);
-  padding:16px 12px;overflow:auto;}
-nav h6{margin:18px 8px 9px;font-size:9px;letter-spacing:.2em;text-transform:uppercase;
-  color:var(--faint);font-weight:650;}
-nav h6:first-child{margin-top:2px;}
-.navitem{position:relative;display:flex;align-items:center;gap:11px;width:100%;
-  padding:9px 11px;border:0;background:none;border-radius:10px;cursor:pointer;text-align:left;
-  color:var(--muted);font-weight:600;font-size:10.5px;text-transform:uppercase;
-  letter-spacing:.13em;transition:background .15s,color .15s;}
-.navitem:hover{background:var(--bg);color:var(--ink);}
-.navitem[aria-current="true"]{background:var(--accent-soft);color:var(--accent);}
-.navitem[aria-current="true"]:before{content:"";position:absolute;left:0;top:50%;
-  width:3px;height:18px;margin-top:-9px;border-radius:0 3px 3px 0;background:var(--grad);}
-.navitem .pill{margin-left:auto;font-size:11px;padding:1px 8px;border-radius:99px;
-  background:var(--bg);color:var(--muted);font-variant-numeric:tabular-nums;font-weight:600;
-  letter-spacing:0;}
-.navitem[aria-current="true"] .pill{background:var(--panel);color:var(--accent);}
-.navitem svg{width:16px;height:16px;flex:none;}
-.navnote{margin:20px 8px 0;padding-top:15px;border-top:1px solid var(--line);
-  font-size:11.5px;color:var(--faint);line-height:1.6;}
-
-main{overflow:auto;position:relative;}
-.pad{padding:28px 32px 66px;max-width:1080px;}
-.pagehead{margin:0 0 8px;font-family:var(--serif);font-size:25px;font-weight:400;
-  text-transform:uppercase;letter-spacing:.14em;line-height:1.25;}
-.pagesub{margin:0 0 26px;color:var(--muted);max-width:70ch;}
-
-/* ---------- diagram ---------- */
-.canvaswrap{position:absolute;inset:0;overflow:hidden;
-  background-image:radial-gradient(var(--dot) 1px,transparent 1px);
-  background-size:24px 24px;}
-.canvaswrap.grab{cursor:grab;} .canvaswrap.grabbing{cursor:grabbing;}
-#stage{position:absolute;top:0;left:0;transform-origin:0 0;}
-#edges{position:absolute;top:0;left:0;overflow:visible;pointer-events:none;}
-.node{position:absolute;background:var(--panel);border:1px solid var(--line);
-  border-radius:var(--radius);box-shadow:var(--shadow),inset 0 1px 0 var(--hi);
-  padding:11px 13px;cursor:pointer;display:flex;gap:11px;align-items:flex-start;
-  transition:border-color .15s,box-shadow .15s,transform .15s;}
-.node:hover{border-color:var(--line-strong);transform:translateY(-1px);}
-.node.sel{border-color:var(--accent);
-  box-shadow:0 0 0 3px var(--accent-soft),var(--shadow-lg),inset 0 1px 0 var(--hi);}
-.node .ico{width:27px;height:27px;border-radius:8px;display:grid;place-items:center;flex:none;
-  background:var(--bg);color:var(--muted);}
-.node .ico svg{width:15px;height:15px;}
-.node .lab{min-width:0;flex:1;}
-.node .lab b{display:block;font-size:10.5px;font-weight:650;text-transform:uppercase;
-  letter-spacing:.1em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.node .lab span{display:block;font-size:11.5px;color:var(--faint);margin-top:2px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.node .cnt{font-family:var(--serif);font-size:15px;font-weight:400;padding:0 5px;flex:none;
-  background:none;color:var(--muted);font-variant-numeric:tabular-nums;line-height:1.3;}
-.node[data-kind="decision"] .ico{background:var(--human-soft);color:var(--human);}
-.node[data-kind="call"]{border-color:color-mix(in srgb,var(--accent) 55%,var(--line));
-  box-shadow:0 0 0 1px var(--accent-soft),var(--shadow),inset 0 1px 0 var(--hi);}
-.node[data-kind="call"] .ico{background:var(--grad);color:#fff;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.3);}
-.node[data-kind="call"] .cnt{color:var(--accent);}
-.node[data-kind="human"] .ico{background:var(--ok-soft);color:var(--ok);}
-.node[data-kind="human"] .cnt{color:var(--ok);}
-.node[data-kind="stop"]{border-style:dashed;box-shadow:none;opacity:.92;}
-.node[data-kind="stop"] .ico{background:var(--stop-soft);color:var(--stop);}
-.node[data-kind="stop"] .cnt{color:var(--stop);}
-.node[data-kind="start"] .ico,.node[data-kind="end"] .ico{background:var(--grad);color:#fff;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.3);}
-.edge{fill:none;stroke:var(--line-strong);stroke-width:1.6;}
-.edge.stop{stroke-dasharray:5 4;}
-.edge.muted{stroke-dasharray:3 5;opacity:.7;}
-.elabel{font-size:9.5px;fill:var(--faint);letter-spacing:.13em;text-transform:uppercase;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-weight:650;}
-.elabelbg{fill:var(--bg);}
-.zoom{position:absolute;left:20px;bottom:20px;display:flex;flex-direction:column;
-  background:var(--panel);border:1px solid var(--line);border-radius:11px;
-  box-shadow:var(--shadow),inset 0 1px 0 var(--hi);overflow:hidden;z-index:3;}
-.zoom button{width:34px;height:34px;border:0;background:none;cursor:pointer;color:var(--muted);
-  display:grid;place-items:center;}
-.zoom button+button{border-top:1px solid var(--line);}
-.zoom button:hover{background:var(--bg);color:var(--ink);}
-.legend{position:absolute;left:20px;top:20px;z-index:3;background:var(--panel);
-  border:1px solid var(--line);border-radius:11px;
-  box-shadow:var(--shadow),inset 0 1px 0 var(--hi);padding:11px 14px;
-  display:flex;gap:16px;font-size:9.5px;color:var(--muted);text-transform:uppercase;
-  letter-spacing:.13em;font-weight:650;}
-.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:6px;
-  vertical-align:middle;}
-
-/* ---------- inspector ---------- */
-.inspector{position:absolute;right:0;top:0;bottom:0;width:364px;background:var(--panel);
-  border-left:1px solid var(--line);padding:22px 24px;overflow:auto;z-index:4;
-  box-shadow:var(--shadow-lg);}
-.inspector[hidden]{display:none!important;}
-.inspector .close{position:absolute;right:14px;top:14px;border:0;background:none;cursor:pointer;
-  color:var(--faint);font-size:18px;line-height:1;border-radius:7px;width:26px;height:26px;}
-.inspector .close:hover{background:var(--bg);color:var(--ink);}
-.inspector h3{margin:0 0 5px;font-family:var(--serif);font-size:19px;font-weight:400;
-  text-transform:uppercase;letter-spacing:.12em;line-height:1.3;}
-.inspector .kind{font-size:9px;text-transform:uppercase;letter-spacing:.19em;color:var(--accent);
-  font-weight:650;}
-.inspector p{color:var(--muted);}
-
-/* ---------- generic ---------- */
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-  box-shadow:var(--shadow),inset 0 1px 0 var(--hi);padding:18px 20px;margin:0 0 14px;}
-.card h4{margin:0 0 14px;font-size:9px;font-weight:650;color:var(--faint);
-  text-transform:uppercase;letter-spacing:.19em;}
-table{border-collapse:collapse;width:100%;font-size:13px;}
-th,td{text-align:left;padding:10px 11px;border-bottom:1px solid var(--line);vertical-align:top;}
-thead th{color:var(--faint);font-weight:650;font-size:9px;text-transform:uppercase;
-  letter-spacing:.17em;padding-bottom:9px;}
+.app{display:grid;grid-template-columns:224px minmax(0,1fr);grid-template-rows:64px minmax(0,1fr);height:100vh;}
+.sidebar{grid-row:1/-1;background:var(--sidebar);color:var(--sidebar-text);display:flex;
+  flex-direction:column;padding:19px 12px 14px;min-height:0;}
+:root[data-theme="dark"] .sidebar{backdrop-filter:blur(30px) saturate(130%);box-shadow:20px 0 70px rgba(3,1,10,.18);}
+.brand{height:36px;display:flex;align-items:center;gap:10px;padding:0 8px;margin-bottom:23px;}
+.brandmark{width:28px;height:28px;display:grid;place-items:center;background:var(--brand);color:#17201e;
+  border-radius:5px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.2);}
+.brandmark svg{width:16px;height:16px;}
+.brandcopy{display:flex;flex-direction:column;line-height:1.08;}
+.brandcopy strong{font-size:15px;font-weight:720;}
+.brandcopy span{font-size:10px;color:var(--sidebar-muted);margin-top:4px;letter-spacing:.08em;text-transform:uppercase;}
+nav{display:flex;flex-direction:column;gap:4px;}
+.nav-label{padding:0 10px;margin:0 0 6px;color:var(--sidebar-muted);font-size:10px;
+  font-weight:700;letter-spacing:.1em;text-transform:uppercase;}
+.navitem{position:relative;width:100%;height:40px;border:0;background:transparent;color:var(--sidebar-muted);
+  border-radius:5px;display:flex;align-items:center;gap:11px;padding:0 10px;cursor:pointer;text-align:left;}
+.navitem:hover{background:var(--sidebar-2);color:var(--sidebar-text);}
+.navitem[aria-current="true"]{background:var(--sidebar-2);color:var(--sidebar-text);}
+.navitem[aria-current="true"]:before{content:"";position:absolute;left:-12px;width:3px;height:22px;background:var(--brand);}
+.navitem svg{width:17px;height:17px;flex:none;}
+.navitem .navtext{font-size:13px;font-weight:600;}
+.navitem .navcount{margin-left:auto;color:var(--sidebar-muted);font-size:10px;font-variant-numeric:tabular-nums;}
+.sidebar-foot{margin-top:auto;border-top:1px solid rgba(255,255,255,.09);padding:14px 8px 3px;
+  color:var(--sidebar-muted);font-size:11px;display:flex;align-items:center;gap:8px;}
+header{grid-column:2;display:flex;align-items:center;gap:16px;padding:0 24px;background:var(--surface);
+  border-bottom:1px solid var(--line);min-width:0;}
+:root[data-theme="dark"] header{backdrop-filter:blur(28px) saturate(130%);}
+.head-context{display:flex;align-items:baseline;gap:9px;min-width:0;}
+.head-context strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.head-context span{font-size:12px;color:var(--faint);white-space:nowrap;}
+.header-actions{margin-left:auto;display:flex;align-items:center;gap:9px;}
+.workspace-state{padding-right:12px;color:var(--faint);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;}
+.header-action{height:32px;border:1px solid var(--line);border-radius:5px;background:var(--surface);
+  padding:0 10px;display:flex;align-items:center;gap:7px;cursor:pointer;color:var(--muted);font-size:12px;font-weight:620;}
+.header-action:hover{border-color:var(--line-strong);color:var(--ink);}
+.header-action svg{width:15px;height:15px;}
+.header-action .alert-count{padding-left:7px;border-left:1px solid var(--line);color:var(--danger);font-size:10px;}
+.icon-btn{width:34px;height:34px;border:1px solid var(--line);border-radius:5px;background:var(--surface);
+  display:grid;place-items:center;cursor:pointer;color:var(--muted);flex:none;}
+.icon-btn:hover{border-color:var(--line-strong);color:var(--ink);}
+.icon-btn svg{width:16px;height:16px;}
+main{position:relative;overflow:auto;min-width:0;background-color:var(--canvas);}
+:root[data-theme="dark"] main:before{content:"";position:fixed;inset:64px 0 0 224px;pointer-events:none;
+  background:linear-gradient(118deg,transparent 5%,rgba(31,207,226,.2) 34%,transparent 58%),
+    linear-gradient(52deg,transparent 39%,rgba(234,55,207,.23) 64%,transparent 89%);
+  filter:blur(68px);opacity:.9;}
+.pad{position:relative;z-index:1;width:min(100%,1320px);margin:0 auto;padding:34px 34px 64px;}
+.eyebrow{font-size:10.5px;font-weight:750;color:var(--accent);letter-spacing:.09em;text-transform:uppercase;margin-bottom:8px;}
+.page-row{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;margin-bottom:25px;}
+.pagehead{font-size:26px;line-height:1.15;margin:0;font-weight:720;letter-spacing:0;}
+.pagesub{margin:7px 0 0;color:var(--muted);max-width:700px;}
+.page-actions{display:flex;align-items:center;gap:9px;flex:none;}
+.btn{height:36px;border:1px solid var(--line-strong);border-radius:5px;background:var(--surface);
+  padding:0 13px;display:inline-flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;font-weight:650;font-size:12.5px;}
+.btn:hover{border-color:var(--ink);}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+:root[data-theme="dark"] .btn.primary{color:#102019;}
+.btn.primary:hover{background:#115b49;border-color:#115b49;}
+.btn:disabled{opacity:.55;cursor:not-allowed;}
+.btn svg{width:15px;height:15px;}
+.text-btn{border:0;background:transparent;color:var(--accent);cursor:pointer;font-weight:650;font-size:12px;padding:4px 0;}
+.crumb{border:0;background:transparent;color:var(--muted);cursor:pointer;padding:0;margin:0 0 18px;
+  display:flex;align-items:center;gap:7px;font-size:12px;font-weight:650;}
+.crumb:hover{color:var(--ink);}
+.crumb svg{width:14px;height:14px;}
+.metric-rail{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px;}
+.metric{min-height:112px;padding:19px 20px;display:grid;grid-template-columns:28px 1fr;gap:12px;align-content:center;
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);backdrop-filter:blur(22px) saturate(130%);}
+.metric-icon{width:28px;height:28px;display:grid;place-items:center;color:var(--muted);}
+.metric-icon svg{width:16px;height:16px;}
+.metric[data-tone="action"] .metric-icon{color:var(--amber);}
+.metric[data-tone="danger"] .metric-icon{color:var(--danger);}
+.metric[data-tone="accent"] .metric-icon{color:var(--accent);}
+:root[data-theme="dark"] .metric[data-tone="action"]{background:rgba(105,57,143,.58);border-color:rgba(202,130,255,.22);}
+:root[data-theme="dark"] .metric[data-tone="action"] .metric-icon{color:#dbb4ff;}
+:root[data-theme="dark"] .metric[data-tone="danger"]{background:rgba(113,35,90,.5);border-color:rgba(255,102,184,.2);}
+:root[data-theme="dark"] .metric[data-tone="danger"] .metric-icon{color:#ff9fcf;}
+:root[data-theme="dark"] .metric[data-tone="accent"]{background:rgba(24,88,96,.48);border-color:rgba(82,229,214,.2);}
+:root[data-theme="dark"] .metric[data-tone="accent"] .metric-icon{color:#75f0dc;}
+:root[data-theme="dark"] .metric:not([data-tone]){background:rgba(46,51,98,.5);border-color:rgba(127,160,255,.18);}
+.metric-copy b{display:block;font-size:22px;line-height:1.05;font-weight:720;font-variant-numeric:tabular-nums;}
+.metric-copy span{display:block;margin-top:7px;color:var(--muted);font-size:11.5px;}
+.overview-grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.8fr);gap:18px;margin-bottom:18px;}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
+  min-width:0;backdrop-filter:blur(24px) saturate(135%);}
+.panel-head{min-height:56px;padding:0 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;}
+.panel-head h2{margin:0;font-size:13px;font-weight:720;}
+.panel-head p{margin:2px 0 0;color:var(--faint);font-size:11.5px;}
+.panel-head .text-btn{margin-left:auto;}
+.attention-list{display:flex;flex-direction:column;}
+.attention-row{width:100%;min-height:66px;border:0;border-bottom:1px solid var(--line);background:transparent;
+  display:grid;grid-template-columns:minmax(0,1.3fr) minmax(120px,.75fr) 92px 28px;align-items:center;
+  gap:14px;padding:10px 17px;text-align:left;cursor:pointer;}
+.attention-row:last-child{border-bottom:0;}
+.attention-row:hover{background:var(--surface-2);}
+.row-primary{min-width:0;}
+.row-primary strong{display:block;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.row-primary span{display:block;margin-top:4px;color:var(--muted);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.row-secondary{font-size:11.5px;color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.row-amount{text-align:right;font-size:12px;font-weight:680;font-variant-numeric:tabular-nums;}
+.row-chevron{display:grid;place-items:center;color:var(--faint);}
+.row-chevron svg{width:15px;height:15px;}
+.health-body{padding:8px 18px 15px;}
+.health-row{min-height:55px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;}
+.health-row:last-child{border-bottom:0;}
+.health-ico{width:26px;height:26px;display:grid;place-items:center;color:var(--accent);}
+.health-ico.warn{color:var(--danger);}
+.health-ico svg{width:13px;height:13px;}
+.health-copy strong{display:block;font-size:12px;}
+.health-copy span{display:block;color:var(--faint);font-size:11px;margin-top:2px;}
+.health-value{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;}
+.process-panel{margin-bottom:18px;overflow:hidden;}
+.process-strip{display:grid;grid-template-columns:repeat(7,minmax(118px,1fr));overflow-x:auto;}
+.process-stage{position:relative;min-width:118px;min-height:104px;border:0;border-right:1px solid var(--line);
+  background:transparent;padding:16px 16px 15px;text-align:left;cursor:pointer;}
+.process-stage:last-child{border-right:0;}
+.process-stage:hover{background:var(--surface-2);}
+.process-stage:after{content:"";position:absolute;right:-5px;top:49px;width:9px;height:9px;border-top:1px solid var(--line-strong);
+  border-right:1px solid var(--line-strong);background:var(--surface);transform:rotate(45deg);z-index:2;}
+.process-stage:last-child:after{display:none;}
+.process-stage:hover:after{background:var(--surface-2);}
+.process-num{display:block;color:var(--accent);font-size:19px;line-height:1;font-weight:720;font-variant-numeric:tabular-nums;}
+.process-stage strong{display:block;margin-top:11px;font-size:11.5px;}
+.process-stage span:last-child{display:block;margin-top:3px;color:var(--faint);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.table-tools{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:12px;}
+.segments{display:inline-flex;border:1px solid var(--line);border-radius:5px;padding:3px;background:var(--surface);}
+.segment{height:29px;border:0;border-radius:3px;background:transparent;padding:0 11px;color:var(--muted);cursor:pointer;font-size:11.5px;font-weight:650;}
+.segment[aria-pressed="true"]{background:var(--ink);color:var(--surface);}
+.search{position:relative;width:238px;}
+.search svg{position:absolute;left:10px;top:9px;width:15px;height:15px;color:var(--faint);pointer-events:none;}
+.search input{width:100%;height:34px;border:1px solid var(--line);border-radius:5px;background:var(--surface);padding:0 10px 0 32px;font-size:12px;}
+.search input::placeholder{color:var(--faint);}
+.table-wrap{overflow:auto;}
+table{width:100%;border-collapse:collapse;table-layout:auto;font-size:12px;}
+th,td{height:48px;padding:8px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap;}
+thead th{height:40px;background:var(--surface-2);color:var(--faint);font-size:10px;font-weight:750;letter-spacing:.07em;text-transform:uppercase;}
 tbody tr:last-child td{border-bottom:0;}
-tbody tr.clickable{cursor:pointer;transition:background .12s;}
-tbody tr.clickable:hover{background:var(--bg);}
+tbody tr.clickable{cursor:pointer;}
+tbody tr.clickable:hover{background:var(--surface-2);}
 td.r,th.r{text-align:right;font-variant-numeric:tabular-nums;}
-.badge{display:inline-block;padding:3px 9px;border-radius:99px;font-size:9px;font-weight:650;
-  background:var(--bg);color:var(--muted);text-transform:uppercase;letter-spacing:.12em;
-  box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 16%,transparent);}
-.badge.ok{background:var(--ok-soft);color:var(--ok);}
-.badge.warn{background:var(--warn-soft);color:var(--warn);}
-.badge.bad{background:var(--stop-soft);color:var(--stop);}
-.badge.accent{background:var(--accent-soft);color:var(--accent);}
-.btn{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:10px 18px;
-  cursor:pointer;font-weight:650;font-size:10px;text-transform:uppercase;letter-spacing:.14em;
-  transition:border-color .15s,background .15s,transform .1s;}
-.btn:hover{border-color:var(--line-strong);background:var(--bg);}
-.btn:active{transform:translateY(1px);}
-.btn.primary{background:var(--grad);border-color:transparent;color:#fff;
-  box-shadow:0 6px 18px var(--glow-a),inset 0 1px 0 rgba(255,255,255,.28);}
-.btn.primary:hover{filter:brightness(1.08);background:var(--grad);}
-.quote{border-left:2px solid transparent;border-image:var(--grad) 1;padding:7px 0 7px 16px;
-  color:var(--muted);font-family:var(--serif);font-size:15px;font-style:italic;
-  line-height:1.65;margin:12px 0 0;}
-.turns{border:1px solid var(--line);border-radius:11px;overflow:hidden;}
-.turn{display:flex;gap:13px;padding:8px 13px;border-bottom:1px solid var(--line);}
+.badge{display:inline-flex;align-items:center;min-height:22px;padding:0;background:transparent;color:var(--muted);
+  font-size:10px;font-weight:720;letter-spacing:.055em;text-transform:uppercase;white-space:nowrap;}
+.badge:before{display:none;}
+.badge.ok{background:transparent;color:var(--accent);}
+.badge.warn{background:transparent;color:var(--amber);}
+.badge.bad{background:transparent;color:var(--danger);}
+.badge.blue{background:transparent;color:var(--blue);}
+.empty{padding:46px 22px;text-align:center;color:var(--faint);}
+.empty svg{display:block;width:22px;height:22px;margin:0 auto 10px;}
+.review-shell{display:grid;grid-template-columns:minmax(270px,.72fr) minmax(0,1.45fr);min-height:560px;overflow:hidden;}
+.review-list{border-right:1px solid var(--line);min-width:0;}
+.review-list-head{height:48px;padding:0 16px;display:flex;align-items:center;border-bottom:1px solid var(--line);
+  color:var(--muted);font-size:11px;font-weight:680;}
+.review-choice{width:100%;min-height:70px;border:0;border-bottom:1px solid var(--line);background:transparent;
+  padding:12px 15px;text-align:left;cursor:pointer;display:block;}
+.review-choice:hover{background:var(--surface-2);}
+.review-choice[aria-current="true"]{background:rgba(150,78,202,.16);box-shadow:inset 2px 0 var(--magenta);}
+.review-choice-top{display:flex;align-items:center;gap:8px;min-width:0;}
+.review-choice strong{font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.review-choice .badge{margin-left:auto;}
+.review-choice p{margin:6px 0 0;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.review-detail{padding:24px 26px;min-width:0;}
+.detail-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding-bottom:19px;border-bottom:1px solid var(--line);}
+.detail-head h2{font-size:18px;margin:0 0 6px;}
+.detail-meta{color:var(--muted);font-size:11.5px;}
+.section-label{margin:23px 0 10px;color:var(--faint);font-size:10px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;}
+.field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border:1px solid var(--line);border-radius:5px;overflow:hidden;}
+.field{min-height:59px;padding:10px 13px;border-bottom:1px solid var(--line);}
+.field:nth-child(odd){border-right:1px solid var(--line);}
+.field:nth-last-child(-n+2){border-bottom:0;}
+.field:last-child:nth-child(odd){border-bottom:0;}
+.field span{display:block;color:var(--faint);font-size:10.5px;margin-bottom:5px;text-transform:capitalize;}
+.field strong{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;font-weight:600;word-break:break-word;}
+.evidence{margin:0;padding:15px 16px;border-left:2px solid var(--accent);background:var(--accent-soft);color:var(--ink);font-size:12.5px;line-height:1.6;}
+.evidence.bad{border-left-color:var(--danger);background:var(--danger-soft);color:var(--danger);}
+.detail-actions{display:flex;gap:9px;align-items:center;margin-top:22px;}
+.detail-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow);}
+.detail-stat{padding:17px 18px;min-height:82px;}
+.detail-stat+.detail-stat{border-left:1px solid var(--line);}
+.detail-stat b{display:block;font-size:18px;font-weight:720;font-variant-numeric:tabular-nums;}
+.detail-stat span{display:block;color:var(--faint);font-size:10.5px;margin-top:6px;}
+.stack{display:flex;flex-direction:column;gap:12px;margin-top:14px;}
+.claim-card{padding:18px 19px;}
+.claim-card-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:15px;}
+.claim-card-head strong{margin-right:auto;}
+.kv{display:grid;grid-template-columns:minmax(150px,.45fr) minmax(0,1fr);gap:0;border-top:1px solid var(--line);}
+.kv dt,.kv dd{margin:0;padding:8px 0;border-bottom:1px solid var(--line);}
+.kv dt{color:var(--faint);font-size:11px;text-transform:capitalize;}
+.kv dd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;word-break:break-word;}
+.quote{margin:15px 0 0;padding:13px 15px;background:var(--accent-soft);border-left:2px solid var(--accent);font-size:12.5px;line-height:1.6;}
+.alert{margin-top:14px;padding:13px 15px;border:1px solid var(--line);border-left:3px solid var(--amber);background:var(--surface);border-radius:4px;color:var(--muted);}
+.alert strong{display:block;color:var(--ink);font-size:12px;margin-bottom:4px;}
+.alert ul{margin:5px 0 0;padding-left:18px;}
+.transcript{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;}
+.turn{display:grid;grid-template-columns:62px 94px minmax(0,1fr);gap:12px;padding:10px 14px;border-bottom:1px solid var(--line);}
 .turn:last-child{border-bottom:0;}
-.turn .t{color:var(--faint);min-width:56px;font-variant-numeric:tabular-nums;font-size:11.5px;
-  letter-spacing:.03em;}
-.turn.bot{background:var(--bg);}
-.holdgap{display:flex;align-items:center;gap:10px;padding:9px 13px;background:var(--warn-soft);
-  color:var(--warn);font-weight:650;font-size:9.5px;text-transform:uppercase;letter-spacing:.14em;
-  border-bottom:1px solid var(--line);}
-.holdgap:before{content:"";flex:none;width:6px;height:6px;border-radius:99px;background:currentColor;
-  box-shadow:0 0 0 3px color-mix(in srgb,currentColor 22%,transparent);}
-.kv{display:grid;grid-template-columns:minmax(128px,auto) 1fr;gap:9px 20px;font-size:13px;}
-.kv dt{color:var(--faint);font-size:9.5px;text-transform:uppercase;letter-spacing:.13em;
-  font-weight:650;padding-top:2px;}
-.kv dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
-  word-break:break-word;}
-.empty{color:var(--faint);padding:28px;text-align:center;font-family:var(--serif);
-  font-size:15px;font-style:italic;}
-.note{color:var(--faint);font-size:12px;margin-top:22px;line-height:1.65;}
-.crumb{border:0;background:none;color:var(--accent);cursor:pointer;padding:0;margin-bottom:14px;
-  font-weight:650;font-size:9.5px;text-transform:uppercase;letter-spacing:.14em;}
-.crumb:hover{text-decoration:underline;text-underline-offset:4px;}
-.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px;}
-.stat{position:relative;overflow:hidden;background:var(--panel);border:1px solid var(--line);
-  border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow),inset 0 1px 0 var(--hi);}
-.stat:before{content:"";position:absolute;left:0;top:0;height:2px;width:100%;
-  background:var(--grad);opacity:.75;}
-.stat b{display:block;font-family:var(--serif);font-size:31px;font-weight:400;
-  letter-spacing:.01em;line-height:1.15;font-variant-numeric:tabular-nums;margin-bottom:5px;}
-.stat span{font-size:9px;color:var(--faint);text-transform:uppercase;letter-spacing:.17em;
-  font-weight:650;}
-@media (max-width:900px){
-  .app{grid-template-columns:1fr;}
-  nav{display:none;}
-  .inspector{width:100%;}
+.turn.bot{background:var(--surface-2);}
+.turn-time{color:var(--faint);font-size:11px;font-variant-numeric:tabular-nums;}
+.turn-speaker{font-size:11px;font-weight:700;}
+.turn-copy{font-size:12px;line-height:1.55;}
+.holdgap{height:34px;display:flex;align-items:center;gap:8px;padding:0 14px;background:var(--amber-soft);color:var(--amber);
+  border-bottom:1px solid var(--line);font-size:10.5px;font-weight:720;letter-spacing:.04em;text-transform:uppercase;}
+.holdgap svg{width:13px;height:13px;}
+.note{color:var(--faint);font-size:11px;line-height:1.6;margin:15px 0 0;}
+@media (max-width:1050px){
+  .metric-rail{grid-template-columns:repeat(2,1fr);}
+  .overview-grid{grid-template-columns:1fr;}
+  .detail-grid{grid-template-columns:repeat(2,1fr);}
+  .detail-stat:nth-child(3){border-left:0;border-top:1px solid var(--line);}
+  .detail-stat:nth-child(4){border-top:1px solid var(--line);}
+}
+@media (max-width:780px){
+  .app{grid-template-columns:1fr;grid-template-rows:56px minmax(0,1fr);padding-bottom:68px;}
+  .sidebar{position:fixed;left:0;right:0;bottom:0;height:68px;z-index:20;padding:7px 8px;display:block;border-top:1px solid rgba(255,255,255,.1);}
+  .brand,.nav-label,.sidebar-foot{display:none;}
+  nav{display:grid;grid-template-columns:repeat(4,1fr);height:100%;gap:4px;}
+  .navitem{height:54px;justify-content:center;flex-direction:column;gap:3px;padding:4px;}
+  .navitem[aria-current="true"]:before{left:25%;right:25%;top:-7px;width:auto;height:3px;}
+  .navitem .navtext{font-size:10px;}
+  .navitem .navcount{position:absolute;right:calc(50% - 27px);top:3px;margin:0;font-size:9px;}
+  header{grid-column:1;padding:0 16px;}
+  main{grid-row:2;}
+  :root[data-theme="dark"] main:before{inset:56px 0 68px 0;}
+  .pad{padding:26px 18px 50px;}
+  .review-shell{grid-template-columns:1fr;}
+  .review-list{border-right:0;border-bottom:1px solid var(--line);max-height:272px;overflow:auto;}
+  .review-detail{padding:20px 18px;}
+}
+@media (max-width:600px){
+  .head-context span{display:none;}
+  .header-action .header-action-label{display:none;}
+  .page-row{align-items:flex-start;flex-direction:column;margin-bottom:20px;}
+  .pagehead{font-size:23px;}
+  .metric-rail{grid-template-columns:1fr 1fr;}
+  .metric{min-height:96px;padding:14px;grid-template-columns:1fr;gap:8px;}
+  .metric-icon{width:27px;height:27px;}
+  .attention-row{grid-template-columns:minmax(0,1fr) 74px 24px;}
+  .attention-row .row-secondary{display:none;}
+  .table-tools{align-items:stretch;flex-direction:column;}
+  .segments{overflow-x:auto;}
+  .search{width:100%;}
+  .field-grid{grid-template-columns:1fr;}
+  .field:nth-child(odd){border-right:0;}
+  .field:nth-last-child(-n+2){border-bottom:1px solid var(--line);}
+  .field:last-child{border-bottom:0;}
+  .detail-grid{grid-template-columns:1fr 1fr;}
+  .detail-stat{padding:13px;}
+  .turn{grid-template-columns:50px minmax(0,1fr);}
+  .turn-speaker{grid-column:2;grid-row:1;}
+  .turn-copy{grid-column:2;}
 }
 """
 
 
 ICONS = {
-    "start": "<path d='M5 3v18l14-9z'/>",
-    "step": "<rect x='3' y='5' width='18' height='14' rx='2'/><path d='M3 10h18'/>",
-    "decision": "<path d='M12 3l9 9-9 9-9-9z'/>",
-    "call": "<path d='M4 4h4l2 5-2.5 1.5a12 12 0 006 6L15 14l5 2v4a2 2 0 01-2 2A16 16 0 012 6a2 2 0 012-2z'/>",
-    "human": "<circle cx='12' cy='8' r='3.5'/><path d='M5 20a7 7 0 0114 0'/>",
-    "stop": "<circle cx='12' cy='12' r='9'/><path d='M8 12h8'/>",
-    "end": "<circle cx='12' cy='12' r='9'/><path d='M8.5 12.5l2.5 2.5 4.5-5'/>",
+    "overview": "<rect x='3' y='3' width='7' height='7' rx='1'/><rect x='14' y='3' width='7' height='7' rx='1'/><rect x='3' y='14' width='7' height='7' rx='1'/><rect x='14' y='14' width='7' height='7' rx='1'/>",
+    "claims": "<path d='M6 3h12a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V5a2 2 0 012-2z'/><path d='M8 8h8M8 12h8M8 16h5'/>",
+    "call": "<path d='M5 4h3l2 5-2 1.5a12 12 0 005.5 5.5L15 14l5 2v3a2 2 0 01-2 2A15 15 0 013 6a2 2 0 012-2z'/>",
+    "review": "<circle cx='12' cy='8' r='3.5'/><path d='M5 20a7 7 0 0114 0'/><path d='M18 4l1.5 1.5L22 3'/>",
+    "clock": "<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>",
+    "alert": "<path d='M12 3L2.5 20h19z'/><path d='M12 9v4M12 17h.01'/>",
+    "check": "<path d='M5 12.5l4 4L19 6.5'/>",
+    "shield": "<path d='M12 3l7 3v5c0 4.5-2.8 8-7 10-4.2-2-7-5.5-7-10V6z'/><path d='M9 12l2 2 4-4'/>",
+    "search": "<circle cx='11' cy='11' r='7'/><path d='M20 20l-4-4'/>",
+    "arrow": "<path d='M5 12h14M14 7l5 5-5 5'/>",
+    "back": "<path d='M19 12H5M10 7l-5 5 5 5'/>",
+    "sun": "<circle cx='12' cy='12' r='4'/><path d='M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4'/>",
+    "moon": "<path d='M20 15.2A8.5 8.5 0 118.8 4a7 7 0 0011.2 11.2z'/>",
+    "file": "<path d='M6 3h8l4 4v14H6z'/><path d='M14 3v5h5M9 13h6M9 17h4'/>",
+    "phone_in": "<path d='M15 3h6v6M21 3l-7 7'/><path d='M5 4h3l2 5-2 1.5a12 12 0 005.5 5.5L15 14l5 2v3a2 2 0 01-2 2A15 15 0 013 6a2 2 0 012-2z'/>",
+    "empty": "<path d='M4 7h16v12H4z'/><path d='M8 11h8M9 3h6'/>",
 }
+
 
 SCRIPT = r"""
 'use strict';
-var S={view:'workflow',graph:null,sel:null,detail:null};
+var S={view:'overview',detail:null,graph:null,claims:[],calls:[],review:[],reviewId:null,claimFilter:'all',query:''};
 var ICONS=__ICONS__;
-
-function api(p){return fetch(p,{headers:{'Accept':'application/json'}}).then(function(r){
-  if(!r.ok)throw new Error(r.status);return r.json();});}
-function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;
-  if(x!==undefined&&x!==null)e.textContent=String(x);return e;}
-function svg(t,a){var e=document.createElementNS('http://www.w3.org/2000/svg',t);
-  for(var k in a)e.setAttribute(k,a[k]);return e;}
-function icon(kind){var s=svg('svg',{viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',
-  'stroke-width':'1.8','stroke-linecap':'round','stroke-linejoin':'round'});
-  s.innerHTML=ICONS[kind]||ICONS.step;return s;}
-function money(n){return '$'+Number(n||0).toFixed(2);}
-function clear(n){while(n.firstChild)n.removeChild(n.firstChild);}
-
-/* ---------------- theme ---------------- */
-function initTheme(){
-  var saved=null;try{saved=localStorage.getItem('tl-theme');}catch(e){}
-  if(saved)document.documentElement.setAttribute('data-theme',saved);
-  document.getElementById('theme').addEventListener('click',function(){
-    var cur=document.documentElement.getAttribute('data-theme');
-    var next=cur==='dark'?'light':'dark';
-    document.documentElement.setAttribute('data-theme',next);
-    try{localStorage.setItem('tl-theme',next);}catch(e){}
-  });
-}
-
-/* ---------------- routing ---------------- */
-function go(view,detail){S.view=view;S.detail=detail||null;
-  var h='#/'+view+(detail?'/'+encodeURIComponent(detail):'');
-  if(location.hash!==h)location.hash=h; else render();}
-function fromHash(){
-  var p=(location.hash||'#/workflow').replace(/^#\//,'').split('/');
-  S.view=p[0]||'workflow';S.detail=p[1]?decodeURIComponent(p[1]):null;render();}
-
-/* ---------------- chrome ---------------- */
-var NAV=[['workflow','Workflow','decision'],['queue','Work queue','step'],
-         ['calls','Calls','call'],['review','Needs a person','human']];
-function paintNav(){
-  var t=S.graph?S.graph.totals:{};
-  var counts={workflow:null,queue:t.queued,calls:t.calls,review:t.review};
-  var nav=document.getElementById('nav');clear(nav);
-  var h=el('h6',null,'Pipeline');nav.appendChild(h);
-  NAV.forEach(function(row){
-    var b=el('button','navitem');b.type='button';
-    b.setAttribute('aria-current',S.view===row[0]?'true':'false');
-    b.appendChild(icon(row[2]));b.appendChild(el('span',null,row[1]));
-    var n=counts[row[0]];
-    if(n!==null&&n!==undefined)b.appendChild(el('span','pill',n));
-    b.addEventListener('click',function(){go(row[0]);});
-    nav.appendChild(b);
-  });
-  var note=el('div','navnote');
-  note.appendChild(el('div',null,'Loopback only. No authentication, and it cannot place a call.'));
-  nav.appendChild(note);
-}
-function paintHeader(){
-  var t=S.graph?S.graph.totals:{};
-  var box=document.getElementById('hstats');clear(box);
-  [[t.hold_human||'0m 00s','hold absorbed'],[t.calls||0,'calls'],
-   [t.awaiting_approval||0,'awaiting approval']].forEach(function(p){
-    var d=el('div','hstat');d.appendChild(el('b',null,p[0]));d.appendChild(el('span',null,p[1]));
-    box.appendChild(d);});
-}
-
-/* ---------------- workflow diagram ---------------- */
-var VIEW={x:0,y:0,k:1};
-function nodeById(id){for(var i=0;i<S.graph.nodes.length;i++)
-  if(S.graph.nodes[i].id===id)return S.graph.nodes[i];return null;}
-
-function drawWorkflow(main){
-  var wrap=el('div','canvaswrap grab');wrap.id='cw';
-  var stage=el('div');stage.id='stage';
-  var edges=svg('svg',{id:'edges'});
-  stage.appendChild(edges);
-
-  var maxX=0,maxY=0;
-  S.graph.nodes.forEach(function(n){
-    maxX=Math.max(maxX,n.x+n.w);maxY=Math.max(maxY,n.y+n.h);
-    var d=el('div','node');d.dataset.kind=n.kind;d.dataset.id=n.id;
-    d.style.left=n.x+'px';d.style.top=n.y+'px';
-    d.style.width=n.w+'px';d.style.minHeight=n.h+'px';
-    var ic=el('div','ico');ic.appendChild(icon(n.kind));d.appendChild(ic);
-    var lab=el('div','lab');lab.appendChild(el('b',null,n.label));
-    lab.appendChild(el('span',null,n.sub));d.appendChild(lab);
-    if(n.count)d.appendChild(el('div','cnt',n.count));
-    d.addEventListener('click',function(ev){ev.stopPropagation();select(n.id);});
-    stage.appendChild(d);
-  });
-  edges.setAttribute('width',maxX+160);edges.setAttribute('height',maxY+80);
-  var defs=svg('defs');
-  var m=svg('marker',{id:'arrow',viewBox:'0 0 10 10',refX:'9',refY:'5',
-    markerWidth:'7',markerHeight:'7',orient:'auto-start-reverse'});
-  m.appendChild(svg('path',{d:'M0 0L10 5L0 10z',fill:'var(--line-strong)'}));
-  defs.appendChild(m);edges.appendChild(defs);
-
-  S.graph.edges.forEach(function(e){
-    var a=nodeById(e.from),b=nodeById(e.to);if(!a||!b)return;
-    var cls='edge'+(e.tone?' '+e.tone:'');
-    var d,lx,ly,anchor='start';
-    if(e.kind==='loop'){
-      var ax=a.x+a.w,ay=a.y+a.h/2,bx=b.x+b.w,by=b.y+b.h/2,out=maxX+110;
-      d='M'+ax+' '+ay+' C'+out+' '+ay+','+out+' '+by+','+bx+' '+by;
-      lx=out-26;ly=(ay+by)/2;
-    }else if(a.x===b.x){
-      var x=a.x+a.w/2,y1=a.y+a.h,y2=b.y;
-      d='M'+x+' '+y1+' L'+x+' '+y2;lx=x+9;ly=(y1+y2)/2+4;
-    }else{
-      var sx=a.x+a.w,sy=a.y+a.h/2,tx=b.x,ty=b.y+b.h/2;
-      var mid=(sx+tx)/2;
-      d='M'+sx+' '+sy+' C'+mid+' '+sy+','+mid+' '+ty+','+tx+' '+ty;
-      lx=mid;ly=(sy+ty)/2-9;anchor='middle';
-    }
-    edges.appendChild(svg('path',{d:d,class:cls,'marker-end':'url(#arrow)'}));
-    if(e.label){
-      var g=svg('g');
-      var bg=svg('rect',{class:'elabelbg',rx:'4'});
-      var tx2=svg('text',{class:'elabel',x:lx,y:ly,'text-anchor':
-        e.kind==='loop'?'middle':anchor});
-      tx2.textContent=e.label;g.appendChild(bg);g.appendChild(tx2);edges.appendChild(g);
-      setTimeout(function(){var bb=tx2.getBBox();
-        bg.setAttribute('x',bb.x-4);bg.setAttribute('y',bb.y-2);
-        bg.setAttribute('width',bb.width+8);bg.setAttribute('height',bb.height+4);},0);
-    }
-  });
-
-  wrap.appendChild(stage);
-
-  var legend=el('div','legend');
-  [['var(--accent)','the call'],['var(--human)','a decision'],
-   ['var(--ok)','a person'],['var(--stop)','stopped here']].forEach(function(p){
-    var s=el('span');var i=el('i');i.style.background=p[0];
-    s.appendChild(i);s.appendChild(document.createTextNode(p[1]));legend.appendChild(s);});
-  wrap.appendChild(legend);
-
-  var zoom=el('div','zoom');
-  [['+',function(){zoomBy(1.2);}],['−',function(){zoomBy(1/1.2);}],
-   ['⤢',function(){fit();}]].forEach(function(p){
-    var b=el('button',null,p[0]);b.type='button';b.addEventListener('click',p[1]);
-    zoom.appendChild(b);});
-  wrap.appendChild(zoom);
-
-  var insp=el('aside','inspector');insp.id='insp';insp.hidden=true;wrap.appendChild(insp);
-  wrap.addEventListener('click',function(){select(null);});
-  main.appendChild(wrap);
-
-  wrap.addEventListener('wheel',function(ev){
-    ev.preventDefault();
-    if(ev.ctrlKey||ev.metaKey){zoomBy(ev.deltaY<0?1.1:1/1.1);return;}
-    VIEW.x-=ev.deltaX;VIEW.y-=ev.deltaY;applyView();},{passive:false});
-  var drag=null;
-  wrap.addEventListener('pointerdown',function(ev){
-    if(ev.target.closest('.node,.inspector,.zoom,.legend'))return;
-    drag={x:ev.clientX-VIEW.x,y:ev.clientY-VIEW.y};wrap.classList.add('grabbing');
-    wrap.setPointerCapture(ev.pointerId);});
-  wrap.addEventListener('pointermove',function(ev){
-    if(!drag)return;VIEW.x=ev.clientX-drag.x;VIEW.y=ev.clientY-drag.y;applyView();});
-  wrap.addEventListener('pointerup',function(){drag=null;wrap.classList.remove('grabbing');});
-  S.bounds={w:maxX,h:maxY};
-  fitWidth();
-}
-function applyView(){var s=document.getElementById('stage');
-  if(s)s.style.transform='translate('+VIEW.x+'px,'+VIEW.y+'px) scale('+VIEW.k+')';}
-function zoomBy(f){VIEW.k=Math.min(2,Math.max(.35,VIEW.k*f));applyView();}
-function metrics(){
-  var w=document.getElementById('cw');if(!w||!S.bounds)return null;
-  return {w:w,aw:w.clientWidth-(S.sel?372:0),ah:w.clientHeight};}
-/* On load, scale to the width and leave the flow readable; the reader pans down. */
-function fitWidth(){
-  var m=metrics();if(!m)return;
-  VIEW.k=Math.max(.62,Math.min(1,(m.aw-120)/S.bounds.w));
-  VIEW.x=(m.aw-S.bounds.w*VIEW.k)/2;VIEW.y=84;applyView();}
-/* The button: show the whole pipeline at once, however small that has to be. */
-function fit(){
-  var m=metrics();if(!m)return;
-  VIEW.k=Math.max(.3,Math.min(1,Math.min((m.aw-80)/S.bounds.w,(m.ah-80)/S.bounds.h)));
-  VIEW.x=(m.aw-S.bounds.w*VIEW.k)/2;VIEW.y=(m.ah-S.bounds.h*VIEW.k)/2;applyView();}
-
-function select(id){
-  S.sel=id;
-  var nodes=document.querySelectorAll('.node');
-  for(var i=0;i<nodes.length;i++)
-    nodes[i].classList.toggle('sel',nodes[i].dataset.id===id);
-  var insp=document.getElementById('insp');if(!insp)return;
-  clear(insp);
-  if(!id){insp.hidden=true;return;}
-  var n=nodeById(id);insp.hidden=false;
-  var x=el('button','close','×');x.type='button';
-  x.addEventListener('click',function(ev){ev.stopPropagation();select(null);});
-  insp.appendChild(x);
-  var kindName={start:'entry',step:'step',decision:'decision',call:'the call',
-    human:'human gate',stop:'stopped',end:'exit'}[n.kind]||n.kind;
-  insp.appendChild(el('div','kind',kindName));
-  insp.appendChild(el('h3',null,n.label));
-  insp.appendChild(el('p',null,n.detail));
-  var box=el('div','card');
-  box.appendChild(el('h4',null,'Right now'));
-  var dl=el('dl','kv');
-  dl.appendChild(el('dt',null,'at this stage'));dl.appendChild(el('dd',null,n.count));
-  if(id==='ground'&&S.graph.totals.ungrounded)
-    {dl.appendChild(el('dt',null,'reset to unknown'));
-     dl.appendChild(el('dd',null,S.graph.totals.ungrounded));}
-  if(id==='call'){dl.appendChild(el('dt',null,'hold absorbed'));
-     dl.appendChild(el('dd',null,S.graph.totals.hold_human));}
-  box.appendChild(dl);insp.appendChild(box);
-  var jump={queue:'queue',review:'review',call:'calls',answered:'review',approve:'review'}[id];
-  if(jump){var b=el('button','btn','Open '+jump);b.type='button';
-    b.addEventListener('click',function(ev){ev.stopPropagation();go(jump);});insp.appendChild(b);}
-}
-
-/* ---------------- tables ---------------- */
-function stateBadge(s){
-  var m={answered:'ok',closed:'ok',needs_human:'warn',queued:'',pending_call:'accent',
-    pending_reconciliation:'warn'};
-  var b=el('span','badge '+(m[s]||''),String(s).replace(/_/g,' '));return b;}
-
-function viewQueue(main){
-  var pad=el('div','pad');
-  pad.appendChild(el('h1','pagehead','Work queue'));
-  pad.appendChild(el('p','pagesub','Every claim Trunkline is holding, highest priority first.'));
-  api('/api/claims').then(function(rows){
-    var card=el('div','card');
-    if(!rows.length){card.appendChild(el('div','empty','Nothing queued.'));}
-    else{
-      var t=el('table'),th=el('thead'),tr=el('tr');
-      ['Claim','Payer','Workflow','Billed','Deadline','State','Evidence'].forEach(function(h,i){
-        tr.appendChild(el('th',i===3?'r':null,h));});
-      th.appendChild(tr);t.appendChild(th);
-      var tb=el('tbody');
-      rows.forEach(function(r){
-        var row=el('tr','clickable');
-        var c=el('td');c.appendChild(el('span','mono',r.claim_number));row.appendChild(c);
-        row.appendChild(el('td',null,r.payer));
-        row.appendChild(el('td',null,r.workflow.replace(/_/g,' ')));
-        row.appendChild(el('td','r',money(r.billed_amount)));
-        row.appendChild(el('td',null,r.filing_deadline));
-        var st=el('td');st.appendChild(stateBadge(r.state));row.appendChild(st);
-        var ev=el('td');
-        if(r.has_result)ev.appendChild(el('span','badge '+(r.grounded?'ok':'bad'),
-          r.grounded?'grounded':'no quote'));
-        row.appendChild(ev);
-        row.addEventListener('click',function(){go('claim',r.id);});
-        tb.appendChild(row);});
-      t.appendChild(tb);card.appendChild(t);}
-    pad.appendChild(card);
-  });
-  main.appendChild(pad);
-}
-
-function viewReview(main){
-  var pad=el('div','pad');
-  pad.appendChild(el('h1','pagehead','Needs a person'));
-  pad.appendChild(el('p','pagesub',
-    'Nothing leaves Trunkline on its own. Approve an answer to close and export it.'));
-  api('/api/claims?review=1').then(function(rows){
-    if(!rows.length){var c=el('div','card');c.appendChild(el('div','empty','Nothing to review.'));
-      pad.appendChild(c);return;}
-    rows.forEach(function(r){
-      var card=el('div','card');
-      var head=el('div');head.style.display='flex';head.style.alignItems='center';
-      head.style.gap='10px';head.style.marginBottom='10px';
-      var strong=el('strong','mono',r.claim_number);head.appendChild(strong);
-      head.appendChild(stateBadge(r.state));
-      if(r.has_result)head.appendChild(el('span','badge '+(r.grounded?'ok':'bad'),
-        r.grounded?'evidence found':'no supporting quote'));
-      var sp=el('span');sp.style.marginLeft='auto';
-      sp.appendChild(el('span','badge',r.payer));head.appendChild(sp);
-      card.appendChild(head);
-      var dl=el('dl','kv');
-      Object.keys(r.result||{}).sort().forEach(function(k){
-        if(k.charAt(0)==='_'||k==='claim_number'||k==='evidence_quote')return;
-        dl.appendChild(el('dt',null,k.replace(/_/g,' ')));
-        dl.appendChild(el('dd',null,r.result[k]));});
-      card.appendChild(dl);
-      if(r.result&&r.result.evidence_quote&&r.result.evidence_quote!=='unknown')
-        card.appendChild(el('p','quote','“'+r.result.evidence_quote+'”'));
-      var bar=el('div');bar.style.marginTop='14px';bar.style.display='flex';bar.style.gap='9px';
-      var open=el('button','btn','Open the call');open.type='button';
-      open.addEventListener('click',function(){go('claim',r.id);});bar.appendChild(open);
-      if(r.state==='answered'){
-        var ok=el('button','btn primary','Approve');ok.type='button';
-        ok.addEventListener('click',function(){approve(r.id,ok);});bar.appendChild(ok);}
-      card.appendChild(bar);
-      pad.appendChild(card);});
-  });
-  main.appendChild(pad);
-}
-
-function approve(id,btn){
-  btn.disabled=true;btn.textContent='Approving…';
-  fetch('/approve',{method:'POST',headers:{
-    'Content-Type':'application/x-www-form-urlencoded','X-Trunkline':'1'},
-    body:'claim_id='+encodeURIComponent(id)})
-  .then(function(r){if(!r.ok)throw new Error();return boot();})
-  .then(function(){render();})
-  .catch(function(){btn.disabled=false;btn.textContent='Approve failed, retry';});
-}
-
-function viewCalls(main){
-  var pad=el('div','pad');
-  pad.appendChild(el('h1','pagehead','Calls'));
-  pad.appendChild(el('p','pagesub',
-    'Hold is derived from the gaps between transcript turns, so it is measured, not estimated.'));
-  api('/api/calls').then(function(rows){
-    if(!rows.length){var c=el('div','card');c.appendChild(el('div','empty','No calls yet.'));
-      pad.appendChild(c);return;}
-    rows.forEach(function(r){
-      var card=el('div','card');card.style.cursor='pointer';
-      var head=el('div');head.style.display='flex';head.style.gap='10px';
-      head.style.alignItems='center';head.style.flexWrap='wrap';
-      head.appendChild(el('strong',null,r.payer));
-      head.appendChild(el('span','badge',r.workflow.replace(/_/g,' ')));
-      head.appendChild(el('span','badge '+(r.reached?'ok':'bad'),r.outcome));
-      head.appendChild(el('span','mono',r.phone));
-      var sp=el('span');sp.style.marginLeft='auto';
-      sp.appendChild(el('span','badge',r.mode+' mode'));head.appendChild(sp);
-      card.appendChild(head);
-      var line=el('div');line.style.marginTop='10px';line.style.display='flex';
-      line.style.gap='18px';line.style.flexWrap='wrap';line.style.alignItems='baseline';
-      var big=el('b',null,r.hold_human+' on hold');big.style.fontSize='15px';
-      line.appendChild(big);
-      line.appendChild(el('span','mono','of '+r.total_human+' on the call'));
-      line.appendChild(el('span','mono','talk '+r.talk_human));
-      line.appendChild(el('span','mono',money(r.cost_estimate_usd)));
-      line.appendChild(el('span','mono','ref '+r.reference_number));
-      line.appendChild(el('span','mono',r.claims+' claim(s)'));
-      card.appendChild(line);
-      card.addEventListener('click',function(){go('call',r.id);});
-      pad.appendChild(card);});
-  });
-  main.appendChild(pad);
-}
-
-function backBtn(pad,view,text){
-  var b=el('button','crumb','← '+text);b.type='button';
-  b.addEventListener('click',function(){go(view);});pad.appendChild(b);}
-
-function viewCall(main,id){
-  var pad=el('div','pad');
-  backBtn(pad,'calls','All calls');
-  api('/api/call?id='+encodeURIComponent(id)).then(function(r){
-    pad.appendChild(el('h1','pagehead',r.payer+' · '+r.workflow.replace(/_/g,' ')));
-    pad.appendChild(el('p','pagesub',r.phone+' · reference '+r.reference_number
-      +' · representative '+r.rep_name+' · '+r.mode+' mode'));
-    var s=el('div','grid2');
-    [[r.hold_human,'on hold'],[r.talk_human,'talking'],[r.total_human,'call length'],
-     [money(r.cost_estimate_usd),'estimated cost']].forEach(function(p){
-      var d=el('div','stat');d.appendChild(el('b',null,p[0]));
-      d.appendChild(el('span',null,p[1]));s.appendChild(d);});
-    pad.appendChild(s);
-    if(r.findings&&r.findings.length){
-      var f=el('div','card');f.style.marginTop='14px';
-      f.appendChild(el('h4',null,'Findings'));
-      var ul=el('ul');ul.style.margin='0';ul.style.paddingLeft='18px';
-      r.findings.forEach(function(x){var li=el('li',null,x);li.style.color='var(--stop)';
-        ul.appendChild(li);});
-      f.appendChild(ul);pad.appendChild(f);}
-    var wrap=el('div');wrap.style.marginTop='14px';
-    r.claims.forEach(function(c){
-      var card=el('div','card');
-      var head=el('div');head.style.display='flex';head.style.gap='10px';
-      head.style.alignItems='center';head.style.marginBottom='10px';
-      head.appendChild(el('strong','mono',c.claim_number));
-      head.appendChild(el('span','badge '+(c.grounded?'ok':'bad'),
-        c.grounded?'evidence found in transcript':'no supporting quote'));
-      head.appendChild(stateBadge(c.state));
-      card.appendChild(head);
-      var dl=el('dl','kv');
-      Object.keys(c.fields).sort().forEach(function(k){
-        if(k.charAt(0)==='_'||k==='claim_number'||k==='evidence_quote')return;
-        dl.appendChild(el('dt',null,k.replace(/_/g,' ')));
-        dl.appendChild(el('dd',null,c.fields[k]));});
-      card.appendChild(dl);
-      if(c.fields.evidence_quote&&c.fields.evidence_quote!=='unknown')
-        card.appendChild(el('p','quote','“'+c.fields.evidence_quote+'”'));
-      wrap.appendChild(card);});
-    pad.appendChild(wrap);
-    pad.appendChild(el('h4',null,'Transcript'));
-    var t=el('div','turns');
-    r.transcript.forEach(function(turn){
-      if(turn.hold_before)
-        t.appendChild(el('div','holdgap','on hold for '+turn.hold_before));
-      var d=el('div','turn'+(turn.speaker==='bot'?' bot':''));
-      d.appendChild(el('span','t',turn.at));
-      d.appendChild(el('span',null,turn.text));
-      t.appendChild(d);});
-    pad.appendChild(t);
-    pad.appendChild(el('p','note',
-      'Patient identifiers were removed before this transcript was stored. Claim numbers survive: '
-      +'the redactor matches short identifiers exactly rather than loosely.'));
-  });
-  main.appendChild(pad);
-}
-
-function viewClaim(main,id){
-  var pad=el('div','pad');
-  backBtn(pad,'queue','Work queue');
-  api('/api/claim?id='+encodeURIComponent(id)).then(function(r){
-    pad.appendChild(el('h1','pagehead',r.claim_number));
-    pad.appendChild(el('p','pagesub',r.payer+' · '+r.workflow.replace(/_/g,' ')
-      +' · '+money(r.billed_amount)+' billed · deadline '+r.filing_deadline));
-    var card=el('div','card');
-    var head=el('div');head.style.display='flex';head.style.gap='10px';
-    head.style.marginBottom='12px';
-    head.appendChild(stateBadge(r.state));
-    if(r.has_result)head.appendChild(el('span','badge '+(r.grounded?'ok':'bad'),
-      r.grounded?'evidence found':'no supporting quote'));
-    card.appendChild(head);
-    var dl=el('dl','kv');
-    Object.keys(r.result||{}).sort().forEach(function(k){
-      if(k.charAt(0)==='_'||k==='claim_number'||k==='evidence_quote')return;
-      dl.appendChild(el('dt',null,k.replace(/_/g,' ')));
-      dl.appendChild(el('dd',null,r.result[k]));});
-    card.appendChild(dl);
-    if(r.result&&r.result.evidence_quote&&r.result.evidence_quote!=='unknown')
-      card.appendChild(el('p','quote','“'+r.result.evidence_quote+'”'));
-    pad.appendChild(card);
-    var bar=el('div');bar.style.display='flex';bar.style.gap='9px';
-    if(r.call_id){var b=el('button','btn','Open the call');b.type='button';
-      b.addEventListener('click',function(){go('call',r.call_id);});bar.appendChild(b);}
-    if(r.state==='answered'){var ok=el('button','btn primary','Approve this answer');
-      ok.type='button';ok.addEventListener('click',function(){approve(r.id,ok);});
-      bar.appendChild(ok);}
-    pad.appendChild(bar);
-  });
-  main.appendChild(pad);
-}
-
-/* ---------------- render ---------------- */
-function render(){
-  paintNav();paintHeader();
-  var main=document.getElementById('main');clear(main);
-  if(S.view==='workflow')drawWorkflow(main);
-  else if(S.view==='queue')viewQueue(main);
-  else if(S.view==='calls')viewCalls(main);
-  else if(S.view==='review')viewReview(main);
-  else if(S.view==='call')viewCall(main,S.detail);
-  else if(S.view==='claim')viewClaim(main,S.detail);
-  else{S.view='workflow';drawWorkflow(main);}
-}
-function boot(){return api('/api/graph').then(function(g){
-  S.graph=g;
-  var t=document.getElementById('practice');
-  if(t)t.textContent=g.practice||'';
-  return g;});}
-window.addEventListener('hashchange',fromHash);
-window.addEventListener('resize',function(){if(S.view==='workflow')fitWidth();});
-initTheme();
-boot().then(fromHash).catch(function(){
-  document.getElementById('main').appendChild(
-    el('div','pad','Could not read the ledger.'));});
+function api(path){return fetch(path,{headers:{Accept:'application/json'}}).then(function(response){if(!response.ok)throw new Error(String(response.status));return response.json();});}
+function el(tag,className,text){var node=document.createElement(tag);if(className)node.className=className;if(text!==undefined&&text!==null)node.textContent=String(text);return node;}
+function clear(node){while(node.firstChild)node.removeChild(node.firstChild);}
+function svgIcon(name){var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('fill','none');svg.setAttribute('stroke','currentColor');svg.setAttribute('stroke-width','1.8');svg.setAttribute('stroke-linecap','round');svg.setAttribute('stroke-linejoin','round');svg.innerHTML=ICONS[name]||ICONS.file;return svg;}
+function money(value){return new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(Number(value||0));}
+function human(value){return String(value||'').replace(/_/g,' ').replace(/\b\w/g,function(letter){return letter.toUpperCase();});}
+function shortDate(value){if(!value)return 'Not recorded';var date=new Date(value.length===10?value+'T00:00:00':value);if(Number.isNaN(date.getTime()))return value;return date.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});}
+function nodeById(id){return (S.graph.nodes||[]).find(function(node){return node.id===id;})||{count:0,sub:''};}
+function activeView(){if(S.view==='claim')return 'claims';if(S.view==='call')return 'calls';return S.view;}
+function actionButton(label,primary,iconName,onClick){var button=el('button','btn'+(primary?' primary':''));button.type='button';if(iconName)button.appendChild(svgIcon(iconName));button.appendChild(document.createTextNode(label));if(onClick)button.addEventListener('click',onClick);return button;}
+function textButton(label,onClick){var button=el('button','text-btn',label);button.type='button';button.addEventListener('click',onClick);return button;}
+function initTheme(){var saved='dark';try{saved=localStorage.getItem('tl-theme')||'dark';}catch(error){}document.documentElement.setAttribute('data-theme',saved);paintTheme();document.getElementById('theme').addEventListener('click',function(){var current=document.documentElement.getAttribute('data-theme');document.documentElement.setAttribute('data-theme',current==='dark'?'light':'dark');try{localStorage.setItem('tl-theme',document.documentElement.getAttribute('data-theme'));}catch(error){}paintTheme();});}
+function paintTheme(){var button=document.getElementById('theme');if(!button)return;clear(button);var dark=document.documentElement.getAttribute('data-theme')==='dark';button.appendChild(svgIcon(dark?'sun':'moon'));button.title=dark?'Use light theme':'Use dark theme';button.setAttribute('aria-label',button.title);}
+function go(view,detail){S.view=view;S.detail=detail||null;var hash='#/'+view+(detail?'/'+encodeURIComponent(detail):'');if(location.hash!==hash)location.hash=hash;else render();}
+function fromHash(){var parts=(location.hash||'#/overview').replace(/^#\//,'').split('/');S.view=parts[0]==='workflow'?'overview':(parts[0]||'overview');S.detail=parts[1]?decodeURIComponent(parts[1]):null;render();}
+var NAV=[['overview','Overview','overview'],['claims','Claims','claims'],['calls','Call history','call'],['review','Review','review']];
+function paintNav(){var totals=S.graph?S.graph.totals:{};var counts={claims:S.claims.length,calls:S.calls.length,review:(totals.review||0)+(totals.awaiting_approval||0)};var nav=document.getElementById('nav');clear(nav);nav.appendChild(el('div','nav-label','Workspace'));NAV.forEach(function(item){var button=el('button','navitem');button.type='button';button.setAttribute('aria-current',activeView()===item[0]?'true':'false');button.appendChild(svgIcon(item[2]));button.appendChild(el('span','navtext',item[1]));if(item[0]!=='overview')button.appendChild(el('span','navcount',counts[item[0]]||0));button.addEventListener('click',function(){go(item[0]);});nav.appendChild(button);});}
+function paintHeader(){var totals=S.graph?S.graph.totals:{};var box=document.getElementById('header-actions');clear(box);box.appendChild(el('span','workspace-state',S.calls.some(function(call){return call.mode==='live';})?'Live workspace':'Demo workspace'));var count=(totals.review||0)+(totals.awaiting_approval||0);var review=el('button','header-action');review.type='button';review.appendChild(svgIcon('review'));review.appendChild(el('span','header-action-label','Review queue'));review.appendChild(el('span','alert-count',count));review.addEventListener('click',function(){go('review');});box.appendChild(review);}
+function pageIntro(parent,eyebrow,title,subtitle){parent.appendChild(el('div','eyebrow',eyebrow));var row=el('div','page-row');var copy=el('div');copy.appendChild(el('h1','pagehead',title));copy.appendChild(el('p','pagesub',subtitle));row.appendChild(copy);parent.appendChild(row);return row;}
+function panelHead(title,subtitle,action){var head=el('div','panel-head');var copy=el('div');copy.appendChild(el('h2',null,title));if(subtitle)copy.appendChild(el('p',null,subtitle));head.appendChild(copy);if(action)head.appendChild(action);return head;}
+function badge(state){var className='badge';var label=human(state);if(state==='answered'||state==='closed'||state==='grounded')className+=' ok';else if(state==='needs_human'||state==='partial'||state==='pending_reconciliation')className+=' warn';else if(state==='unsupported'||state==='unusable'||state==='no_quote')className+=' bad';else if(state==='pending_call')className+=' blue';return el('span',className,label);}
+function emptyState(text){var box=el('div','empty');box.appendChild(svgIcon('empty'));box.appendChild(el('span',null,text));return box;}
+function metric(iconName,value,label,tone){var box=el('div','metric');if(tone)box.dataset.tone=tone;var icon=el('div','metric-icon');icon.appendChild(svgIcon(iconName));box.appendChild(icon);var copy=el('div','metric-copy');copy.appendChild(el('b',null,value));copy.appendChild(el('span',null,label));box.appendChild(copy);return box;}
+function reviewRow(record){var row=el('button','attention-row');row.type='button';var primary=el('div','row-primary');primary.appendChild(el('strong','mono',record.claim_number));primary.appendChild(el('span',null,record.payer+' · '+human(record.workflow)));row.appendChild(primary);row.appendChild(el('span','row-secondary',record.state==='needs_human'?'Evidence exception':'Ready for sign-off'));row.appendChild(el('span','row-amount',money(record.billed_amount)));var chevron=el('span','row-chevron');chevron.appendChild(svgIcon('arrow'));row.appendChild(chevron);row.addEventListener('click',function(){S.reviewId=record.id;go('review');});return row;}
+function renderOverview(main){var pad=el('div','pad');pageIntro(pad,'Revenue cycle','Claims operations','Payer answers, evidence, and human sign-off in one operating view.');var totals=S.graph.totals;var metrics=el('section','metric-rail');metrics.appendChild(metric('review',totals.awaiting_approval||0,'Ready for sign-off','action'));metrics.appendChild(metric('alert',totals.review||0,'Needs investigation','danger'));metrics.appendChild(metric('clock',totals.hold_human||'0m','Staff hold time returned','accent'));metrics.appendChild(metric('phone_in',totals.calls||0,'Completed payer calls'));pad.appendChild(metrics);var grid=el('div','overview-grid');var attention=el('section','panel');attention.appendChild(panelHead('Attention queue','Exceptions first, then grounded answers',textButton('Open review',function(){go('review');})));var list=el('div','attention-list');var rows=S.review.slice(0,5);if(!rows.length)list.appendChild(emptyState('Nothing needs review.'));else rows.forEach(function(row){list.appendChild(reviewRow(row));});attention.appendChild(list);grid.appendChild(attention);var health=el('section','panel');health.appendChild(panelHead('Run health','Current ledger'));var body=el('div','health-body');var checks=[['shield','Evidence verified',nodeById('ground').count+' grounded answers',nodeById('ground').count,false],['alert','Evidence exceptions',(totals.ungrounded||0)+' returned to unknown',totals.ungrounded||0,(totals.ungrounded||0)>0],['clock','Pending reconciliation',(totals.in_flight||0)+' calls waiting',totals.in_flight||0,(totals.in_flight||0)>0]];checks.forEach(function(item){var row=el('div','health-row');var ico=el('div','health-ico'+(item[5]?' warn':''));ico.appendChild(svgIcon(item[0]));row.appendChild(ico);var copy=el('div','health-copy');copy.appendChild(el('strong',null,item[1]));copy.appendChild(el('span',null,item[2]));row.appendChild(copy);row.appendChild(el('span','health-value',item[3]));body.appendChild(row);});health.appendChild(body);grid.appendChild(health);pad.appendChild(grid);var process=el('section','panel process-panel');process.appendChild(panelHead('Claim path','Live counts through the controlled workflow'));var strip=el('div','process-strip');var stages=[['intake','Imported','claims'],['bundle','Bundled','calls'],['gate','Cleared','calls'],['call','Reached payer','calls'],['ground','Grounded','review'],['approve','Sign-off','review'],['closed','Closed','claims']];stages.forEach(function(stage){var button=el('button','process-stage');button.type='button';button.appendChild(el('span','process-num',nodeById(stage[0]).count));button.appendChild(el('strong',null,stage[1]));button.appendChild(el('span',null,nodeById(stage[0]).sub));button.addEventListener('click',function(){if(stage[0]==='closed')S.claimFilter='closed';go(stage[2]);});strip.appendChild(button);});process.appendChild(strip);pad.appendChild(process);var recent=el('section','panel');recent.appendChild(panelHead('Recent payer calls','Measured hold and evidence receipts',textButton('View all',function(){go('calls');})));recent.appendChild(callsTable(S.calls.slice(0,4)));pad.appendChild(recent);main.appendChild(pad);}
+function claimsTable(rows){if(!rows.length)return emptyState('No claims match this view.');var wrap=el('div','table-wrap');var table=el('table');var head=el('thead');var header=el('tr');['Claim','Payer','Work type','Billed','Filing deadline','State','Evidence'].forEach(function(label,index){header.appendChild(el('th',index===3?'r':null,label));});head.appendChild(header);table.appendChild(head);var body=el('tbody');rows.forEach(function(record){var row=el('tr','clickable');row.appendChild(el('td','mono',record.claim_number));row.appendChild(el('td',null,record.payer));row.appendChild(el('td',null,human(record.workflow)));row.appendChild(el('td','r',money(record.billed_amount)));row.appendChild(el('td',null,shortDate(record.filing_deadline)));var state=el('td');state.appendChild(badge(record.state));row.appendChild(state);var evidence=el('td');if(record.has_result)evidence.appendChild(badge(record.grounded?'grounded':'no_quote'));else evidence.textContent='—';row.appendChild(evidence);row.addEventListener('click',function(){go('claim',record.id);});body.appendChild(row);});table.appendChild(body);wrap.appendChild(table);return wrap;}
+function filteredClaims(){var query=S.query.trim().toLowerCase();return S.claims.filter(function(record){var pass=S.claimFilter==='all'||(S.claimFilter==='action'&&(record.state==='answered'||record.state==='needs_human'))||(S.claimFilter==='exceptions'&&record.state==='needs_human')||(S.claimFilter==='closed'&&record.state==='closed');var text=(record.claim_number+' '+record.payer+' '+record.workflow).toLowerCase();return pass&&(!query||text.indexOf(query)!==-1);});}
+function renderClaims(main){var pad=el('div','pad');pageIntro(pad,'Work inventory','Claims','Every payer inquiry, ordered by filing risk and value.');var tools=el('div','table-tools');var segments=el('div','segments');[['all','All'],['action','Action needed'],['exceptions','Exceptions'],['closed','Closed']].forEach(function(item){var button=el('button','segment',item[1]);button.type='button';button.setAttribute('aria-pressed',S.claimFilter===item[0]?'true':'false');button.addEventListener('click',function(){S.claimFilter=item[0];render();});segments.appendChild(button);});tools.appendChild(segments);var search=el('label','search');search.appendChild(svgIcon('search'));var input=el('input');input.type='search';input.placeholder='Search claim or payer';input.value=S.query;input.addEventListener('input',function(){S.query=input.value;var body=document.getElementById('claims-table');clear(body);body.appendChild(claimsTable(filteredClaims()));});search.appendChild(input);tools.appendChild(search);pad.appendChild(tools);var panel=el('section','panel');var body=el('div');body.id='claims-table';body.appendChild(claimsTable(filteredClaims()));panel.appendChild(body);pad.appendChild(panel);main.appendChild(pad);}
+function callsTable(rows){if(!rows.length)return emptyState('No payer calls recorded.');var wrap=el('div','table-wrap');var table=el('table');var head=el('thead');var header=el('tr');['Payer','Work type','Outcome','Claims','Hold','Call length','Reference'].forEach(function(label){header.appendChild(el('th',null,label));});head.appendChild(header);table.appendChild(head);var body=el('tbody');rows.forEach(function(record){var row=el('tr','clickable');var payer=el('td');payer.appendChild(el('strong',null,record.payer));payer.appendChild(el('div','mono',record.phone));row.appendChild(payer);row.appendChild(el('td',null,human(record.workflow)));var outcome=el('td');outcome.appendChild(badge(record.outcome));row.appendChild(outcome);row.appendChild(el('td','num',record.claims));row.appendChild(el('td','num',record.hold_human));row.appendChild(el('td','num',record.total_human));row.appendChild(el('td','mono',record.reference_number||'Not recorded'));row.addEventListener('click',function(){go('call',record.id);});body.appendChild(row);});table.appendChild(body);wrap.appendChild(table);return wrap;}
+function detailStat(value,label){var item=el('div','detail-stat');item.appendChild(el('b',null,value));item.appendChild(el('span',null,label));return item;}
+function renderCalls(main){var pad=el('div','pad');pageIntro(pad,'Payer contact','Call history','Measured queue time, representative details, and transcript-backed outcomes.');var totals=S.graph.totals;var details=el('div','detail-grid');details.appendChild(detailStat(totals.calls||0,'Calls recorded'));details.appendChild(detailStat(totals.hold_human||'0m','Total hold absorbed'));details.appendChild(detailStat(nodeById('ground').count,'Grounded answers'));details.appendChild(detailStat(totals.ungrounded||0,'Evidence exceptions'));pad.appendChild(details);var panel=el('section','panel');panel.style.marginTop='18px';panel.appendChild(callsTable(S.calls));pad.appendChild(panel);main.appendChild(pad);}
+function fields(parent,result){var entries=Object.keys(result||{}).filter(function(key){return key.charAt(0)!=='_'&&key!=='claim_number'&&key!=='evidence_quote';}).sort();var grid=el('div','field-grid');entries.forEach(function(key){var item=el('div','field');item.appendChild(el('span',null,human(key)));item.appendChild(el('strong',null,result[key]===null?'Not recorded':result[key]));grid.appendChild(item);});parent.appendChild(grid);}
+function renderReviewDetail(parent,record){clear(parent);if(!record){parent.appendChild(emptyState('Nothing needs review.'));return;}var head=el('div','detail-head');var copy=el('div');copy.appendChild(el('h2','mono',record.claim_number));copy.appendChild(el('div','detail-meta',record.payer+' · '+human(record.workflow)+' · '+money(record.billed_amount)));head.appendChild(copy);head.appendChild(badge(record.state));parent.appendChild(head);parent.appendChild(el('div','section-label','Extracted answer'));fields(parent,record.result||{});parent.appendChild(el('div','section-label','Supporting evidence'));var quote=record.result&&record.result.evidence_quote;parent.appendChild(el('p','evidence'+(record.grounded?'':' bad'),record.grounded&&quote&&quote!=='unknown'?'“'+quote+'”':'No transcript quote supports this answer. Substantive fields were returned to unknown.'));var actions=el('div','detail-actions');if(record.call_id)actions.appendChild(actionButton('Open call',false,'phone_in',function(){go('call',record.call_id);}));if(record.state==='answered')actions.appendChild(actionButton('Approve answer',true,'check',function(event){approve(record.id,event.currentTarget);}));parent.appendChild(actions);}
+function renderReview(main){var pad=el('div','pad');pageIntro(pad,'Human control','Review','Evidence exceptions first, followed by answers ready for sign-off.');if(!S.review.length){var empty=el('section','panel');empty.appendChild(emptyState('The review queue is clear.'));pad.appendChild(empty);main.appendChild(pad);return;}var selected=S.review.find(function(record){return record.id===S.reviewId;})||S.review[0];S.reviewId=selected.id;var shell=el('section','panel review-shell');var list=el('div','review-list');list.appendChild(el('div','review-list-head',S.review.length+' claims require attention'));S.review.forEach(function(record){var choice=el('button','review-choice');choice.type='button';choice.setAttribute('aria-current',record.id===selected.id?'true':'false');var top=el('div','review-choice-top');top.appendChild(el('strong','mono',record.claim_number));top.appendChild(badge(record.state));choice.appendChild(top);choice.appendChild(el('p',null,record.payer+' · '+money(record.billed_amount)));choice.addEventListener('click',function(){S.reviewId=record.id;render();});list.appendChild(choice);});shell.appendChild(list);var detail=el('div','review-detail');renderReviewDetail(detail,selected);shell.appendChild(detail);pad.appendChild(shell);main.appendChild(pad);}
+function approve(id,button){button.disabled=true;clear(button);button.appendChild(document.createTextNode('Approving…'));fetch('/approve',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Trunkline':'1'},body:'claim_id='+encodeURIComponent(id)}).then(function(response){if(!response.ok)throw new Error();return boot();}).then(function(){S.reviewId=null;render();}).catch(function(){button.disabled=false;clear(button);button.appendChild(document.createTextNode('Approval failed · retry'));});}
+function backButton(view,label){var button=el('button','crumb');button.type='button';button.appendChild(svgIcon('back'));button.appendChild(document.createTextNode(label));button.addEventListener('click',function(){go(view);});return button;}
+function definitionList(result){var dl=el('dl','kv');Object.keys(result||{}).sort().forEach(function(key){if(key.charAt(0)==='_'||key==='claim_number'||key==='evidence_quote')return;dl.appendChild(el('dt',null,human(key)));dl.appendChild(el('dd',null,result[key]));});return dl;}
+function renderClaim(main,id){var pad=el('div','pad');pad.appendChild(backButton('claims','All claims'));var record=S.claims.find(function(item){return item.id===id;});if(!record){pad.appendChild(emptyState('Claim not found.'));main.appendChild(pad);return;}api('/api/claim?id='+encodeURIComponent(id)).then(function(detail){pad.appendChild(el('div','eyebrow','Claim record'));var row=el('div','page-row');var copy=el('div');copy.appendChild(el('h1','pagehead',detail.claim_number));copy.appendChild(el('p','pagesub',detail.payer+' · '+human(detail.workflow)+' · '+money(detail.billed_amount)+' billed · files '+shortDate(detail.filing_deadline)));row.appendChild(copy);var actions=el('div','page-actions');actions.appendChild(badge(detail.state));row.appendChild(actions);pad.appendChild(row);var card=el('section','panel claim-card');var head=el('div','claim-card-head');head.appendChild(el('strong',null,'Payer response'));if(detail.has_result)head.appendChild(badge(detail.grounded?'grounded':'no_quote'));card.appendChild(head);card.appendChild(definitionList(detail.result||{}));if(detail.result&&detail.result.evidence_quote&&detail.result.evidence_quote!=='unknown')card.appendChild(el('p','quote','“'+detail.result.evidence_quote+'”'));pad.appendChild(card);var bar=el('div','detail-actions');if(detail.call_id)bar.appendChild(actionButton('Open call',false,'phone_in',function(){go('call',detail.call_id);}));if(detail.state==='answered')bar.appendChild(actionButton('Approve answer',true,'check',function(event){approve(detail.id,event.currentTarget);}));pad.appendChild(bar);}).catch(function(){pad.appendChild(emptyState('Could not load this claim.'));});main.appendChild(pad);}
+function renderCall(main,id){var pad=el('div','pad');pad.appendChild(backButton('calls','Call history'));api('/api/call?id='+encodeURIComponent(id)).then(function(record){pad.appendChild(el('div','eyebrow','Call receipt'));var row=el('div','page-row');var copy=el('div');copy.appendChild(el('h1','pagehead',record.payer));copy.appendChild(el('p','pagesub',human(record.workflow)+' · '+record.phone+' · '+shortDate(record.created_at)+' · '+record.mode+' workspace'));row.appendChild(copy);var state=el('div','page-actions');state.appendChild(badge(record.outcome));row.appendChild(state);pad.appendChild(row);var stats=el('div','detail-grid');stats.appendChild(detailStat(record.hold_human,'On hold'));stats.appendChild(detailStat(record.talk_human,'With representative'));stats.appendChild(detailStat(record.total_human,'Total call'));stats.appendChild(detailStat(money(record.cost_estimate_usd),'Estimated cost'));pad.appendChild(stats);if(record.findings&&record.findings.length){var alert=el('div','alert');alert.appendChild(el('strong',null,'Verification findings'));var list=el('ul');record.findings.forEach(function(item){list.appendChild(el('li',null,item));});alert.appendChild(list);pad.appendChild(alert);}var stack=el('div','stack');record.claims.forEach(function(claim){var card=el('section','panel claim-card');var head=el('div','claim-card-head');head.appendChild(el('strong','mono',claim.claim_number));head.appendChild(badge(claim.grounded?'grounded':'no_quote'));head.appendChild(badge(claim.state));card.appendChild(head);card.appendChild(definitionList(claim.fields));if(claim.fields.evidence_quote&&claim.fields.evidence_quote!=='unknown')card.appendChild(el('p','quote','“'+claim.fields.evidence_quote+'”'));stack.appendChild(card);});pad.appendChild(stack);pad.appendChild(el('div','section-label','Transcript'));var transcript=el('section','transcript');record.transcript.forEach(function(turn){if(turn.hold_before){var gap=el('div','holdgap');gap.appendChild(svgIcon('clock'));gap.appendChild(document.createTextNode('Hold · '+turn.hold_before));transcript.appendChild(gap);}var item=el('div','turn'+(turn.speaker==='bot'?' bot':''));item.appendChild(el('span','turn-time',turn.at));item.appendChild(el('span','turn-speaker',turn.speaker==='bot'?'Trunkline':'Payer'));item.appendChild(el('span','turn-copy',turn.text));transcript.appendChild(item);});pad.appendChild(transcript);pad.appendChild(el('p','note','Patient identifiers were removed before this transcript was stored. Claim numbers remain available for reconciliation.'));}).catch(function(){pad.appendChild(emptyState('Could not load this call.'));});main.appendChild(pad);}
+function render(){paintNav();paintHeader();var main=document.getElementById('main');clear(main);if(S.view==='overview')renderOverview(main);else if(S.view==='claims')renderClaims(main);else if(S.view==='calls')renderCalls(main);else if(S.view==='review')renderReview(main);else if(S.view==='claim')renderClaim(main,S.detail);else if(S.view==='call')renderCall(main,S.detail);else{S.view='overview';renderOverview(main);}}
+function boot(){return Promise.all([api('/api/graph'),api('/api/claims'),api('/api/calls'),api('/api/claims?review=1')]).then(function(results){S.graph=results[0];S.claims=results[1];S.calls=results[2];S.review=results[3];document.getElementById('practice').textContent=S.graph.practice||'Practice workspace';return S.graph;});}
+window.addEventListener('hashchange',fromHash);initTheme();boot().then(fromHash).catch(function(){document.getElementById('main').appendChild(emptyState('Could not read the Trunkline ledger.'));});
 """
 
 
 def script() -> str:
     import json as _json
+
     return SCRIPT.replace("__ICONS__", _json.dumps(ICONS))
 
 
 def shell() -> bytes:
-    """The page skeleton. Every value in it is fetched as JSON and set as text."""
+    """Return the static shell; all ledger values arrive through JSON."""
     return (
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<!doctype html><html lang='en' data-theme='dark'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Trunkline</title><style>" + STYLE + "</style></head><body>"
-        "<div class='app'>"
-        "<header>"
-        "<div class='brand'>Trunkline<em id='practice'></em></div>"
-        "<div class='hstats' id='hstats'></div>"
-        "<button class='themebtn' id='theme' type='button' title='Light or dark'>&#9681;</button>"
-        "</header>"
-        "<nav id='nav'></nav>"
-        "<main id='main'></main>"
-        "</div>"
-        "<script>" + script() + "</script>"
-        "</body></html>"
+        "<meta name='color-scheme' content='light dark'>"
+        "<title>Trunkline · Payer operations</title><style>" + STYLE + "</style></head><body>"
+        "<div class='app'><aside class='sidebar'>"
+        "<div class='brand'><span class='brandmark'><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M5 4h3l2 5-2 1.5a12 12 0 005.5 5.5L15 14l5 2v3a2 2 0 01-2 2A15 15 0 013 6a2 2 0 012-2z'/></svg></span>"
+        "<span class='brandcopy'><strong>Trunkline</strong><span>Payer desk</span></span></div>"
+        "<nav id='nav'></nav><div class='sidebar-foot'>Local review console</div></aside>"
+        "<header><div class='head-context'><strong id='practice'>Practice workspace</strong><span>Payer operations</span></div>"
+        "<div class='header-actions' id='header-actions'></div>"
+        "<button class='icon-btn' id='theme' type='button' title='Use dark theme' aria-label='Use dark theme'></button></header>"
+        "<main id='main'></main></div><script>" + script() + "</script></body></html>"
     ).encode("utf-8")

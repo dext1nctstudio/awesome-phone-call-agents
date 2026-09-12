@@ -74,6 +74,7 @@ def _call_row(ledger, record) -> Dict[str, Any]:
         "outcome": record.outcome or record.status,
         "reached": record.outcome in ui.REACHED_OUTCOMES,
         "mode": record.mode,
+        "created_at": record.created_at,
         "reference_number": record.reference_number,
         "rep_name": record.rep_name,
         "hold_human": hold.format_duration(record.hold_seconds),
